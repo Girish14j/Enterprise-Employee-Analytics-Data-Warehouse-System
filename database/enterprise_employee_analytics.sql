@@ -361,21 +361,50 @@ SELECT
     s.employee_number,
     COALESCE(s.synthetic_employee_name, CONCAT('Employee ', s.employee_number)),
     COALESCE(s.synthetic_employee_email, CONCAT('employee', s.employee_number, '@example.invalid')),
-    s.age, s.gender, s.marital_status, s.education, s.education_field,
-    d.department_id, j.job_role_id, s.job_level, s.synthetic_hire_date,
-    s.attrition, s.business_travel, s.daily_rate, s.distance_from_home,
-    s.environment_satisfaction, s.hourly_rate, s.job_involvement,
-    s.job_satisfaction, s.monthly_income, s.monthly_rate,
-    s.num_companies_worked, s.overtime, s.percent_salary_hike,
-    s.performance_rating, s.relationship_satisfaction, s.stock_option_level,
-    s.total_working_years, s.training_times_last_year, s.work_life_balance,
-    s.years_at_company, s.years_in_current_role, s.years_since_last_promotion,
+    s.age,
+    s.gender,
+    s.marital_status,
+    s.education,
+    s.education_field,
+    d.department_id,
+    j.job_role_id,
+    s.job_level,
+    s.synthetic_hire_date,
+    s.attrition,
+    s.business_travel,
+    s.daily_rate,
+    s.distance_from_home,
+    s.environment_satisfaction,
+    s.hourly_rate,
+    s.job_involvement,
+    s.job_satisfaction,
+    s.monthly_income,
+    s.monthly_rate,
+    s.num_companies_worked,
+    s.overtime,
+    s.percent_salary_hike,
+    s.performance_rating,
+    s.relationship_satisfaction,
+    s.stock_option_level,
+    s.total_working_years,
+    s.training_times_last_year,
+    s.work_life_balance,
+    s.years_at_company,
+    s.years_in_current_role,
+    s.years_since_last_promotion,
     s.years_with_curr_manager,
-    CASE WHEN UPPER(COALESCE(s.attrition, 'NO')) = 'YES'
-         THEN 'Terminated' ELSE 'Active' END
+    CASE
+        WHEN UPPER(COALESCE(s.attrition, 'NO')) = 'YES'
+        THEN 'Terminated'
+        ELSE 'Active'
+    END
 FROM hr_staging.stg_employee_snapshot s
-JOIN departments d ON d.department_name = TRIM(s.department)
-JOIN job_roles j ON j.job_title = TRIM(s.job_role)
+JOIN departments d
+    ON d.department_name COLLATE utf8mb4_unicode_ci
+       = TRIM(s.department) COLLATE utf8mb4_unicode_ci
+JOIN job_roles j
+    ON j.job_title COLLATE utf8mb4_unicode_ci
+       = TRIM(s.job_role) COLLATE utf8mb4_unicode_ci
 ON DUPLICATE KEY UPDATE
     employee_name = VALUES(employee_name),
     email = VALUES(email),
