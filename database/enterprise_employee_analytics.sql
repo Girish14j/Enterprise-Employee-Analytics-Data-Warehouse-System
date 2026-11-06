@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS stg_employee_scd2_history (
     end_date                    DATE NOT NULL,
     is_current                  BOOLEAN NOT NULL,
     change_reason               VARCHAR(100),
+    PRIMARY KEY (employee_number, start_date),
     INDEX idx_stg_history_employee (employee_number),
     INDEX idx_stg_history_dates (start_date, end_date),
     INDEX idx_stg_history_current (employee_number, is_current)
