@@ -421,10 +421,17 @@ INSERT INTO projects (
     project_status, budget
 )
 SELECT
-    p.project_id, p.project_name, d.department_id, p.start_date, p.end_date,
-    p.status, p.budget
+    p.project_id,
+    p.project_name,
+    d.department_id,
+    p.start_date,
+    p.end_date,
+    p.status,
+    p.budget
 FROM hr_staging.stg_projects p
-JOIN departments d ON d.department_name = TRIM(p.department)
+JOIN departments d
+    ON d.department_name COLLATE utf8mb4_unicode_ci
+       = TRIM(p.department) COLLATE utf8mb4_unicode_ci
 ON DUPLICATE KEY UPDATE
     project_name = VALUES(project_name),
     department_id = VALUES(department_id),
