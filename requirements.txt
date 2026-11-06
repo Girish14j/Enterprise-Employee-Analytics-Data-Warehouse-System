@@ -1,0 +1,6 @@
+pandas
+numpy
+Faker
+SQLAlchemy
+mysql-connector-python
+python-dotenv
