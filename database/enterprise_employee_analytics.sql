@@ -658,7 +658,7 @@ ON DUPLICATE KEY UPDATE
 -- This is an initial historical load. Do not truncate Dim_Employee in routine
 -- refreshes. The NOT EXISTS check prevents duplicate versions with the same
 -- employee key and validity start date.
-INSERT INTO dim_employee (
+INSERT INTO hr_dw.dim_employee (
     employee_number, employee_name, employee_email, age, attrition,
     business_travel, daily_rate, department_sk, distance_from_home,
     education, education_field, gender, hourly_rate, job_involvement,
@@ -671,22 +671,51 @@ INSERT INTO dim_employee (
     is_current, change_reason
 )
 SELECT
-    h.employee_number, h.synthetic_employee_name, h.synthetic_employee_email,
-    h.age, h.attrition, h.business_travel, h.daily_rate, dd.department_sk,
-    h.distance_from_home, h.education, h.education_field, h.gender,
-    h.hourly_rate, h.job_involvement, h.job_level, h.job_role,
-    h.job_satisfaction, h.marital_status, h.monthly_income, h.monthly_rate,
-    h.num_companies_worked, h.overtime, h.percent_salary_hike,
-    h.performance_rating, h.relationship_satisfaction, h.stock_option_level,
-    h.total_working_years, h.training_times_last_year, h.work_life_balance,
-    h.years_at_company, h.years_in_current_role, h.years_since_last_promotion,
-    h.years_with_curr_manager, h.synthetic_hire_date, h.start_date, h.end_date,
-    h.is_current, h.change_reason
+    h.employee_number,
+    h.synthetic_employee_name,
+    h.synthetic_employee_email,
+    h.age,
+    h.attrition,
+    h.business_travel,
+    h.daily_rate,
+    dd.department_sk,
+    h.distance_from_home,
+    h.education,
+    h.education_field,
+    h.gender,
+    h.hourly_rate,
+    h.job_involvement,
+    h.job_level,
+    h.job_role,
+    h.job_satisfaction,
+    h.marital_status,
+    h.monthly_income,
+    h.monthly_rate,
+    h.num_companies_worked,
+    h.overtime,
+    h.percent_salary_hike,
+    h.performance_rating,
+    h.relationship_satisfaction,
+    h.stock_option_level,
+    h.total_working_years,
+    h.training_times_last_year,
+    h.work_life_balance,
+    h.years_at_company,
+    h.years_in_current_role,
+    h.years_since_last_promotion,
+    h.years_with_curr_manager,
+    h.synthetic_hire_date,
+    h.start_date,
+    h.end_date,
+    h.is_current,
+    h.change_reason
 FROM hr_staging.stg_employee_scd2_history h
-JOIN dim_department dd ON dd.department_name = TRIM(h.department)
+JOIN hr_dw.dim_department dd
+    ON dd.department_name COLLATE utf8mb4_unicode_ci
+       = TRIM(h.department) COLLATE utf8mb4_unicode_ci
 WHERE NOT EXISTS (
     SELECT 1
-    FROM dim_employee existing
+    FROM hr_dw.dim_employee existing
     WHERE existing.employee_number = h.employee_number
       AND existing.start_date = h.start_date
 );
