@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 
 certificates/*.pem
+certificates/
 
 data/*.csv
 data/generated/*.csv
