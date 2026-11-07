@@ -11,3 +11,30 @@ certificates/*.pem
 
 data/*.csv
 data/generated/*.csv
+
+
+# Python / virtual environment
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Secrets and credentials (never commit) 
+.streamlit/secrets.toml
+certs/
+*.pem
+*.crt
+*.key
+
+# Local-only files
+check_schema.py
+tests/integration/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Logs and archives
+*.log
+*.zip
