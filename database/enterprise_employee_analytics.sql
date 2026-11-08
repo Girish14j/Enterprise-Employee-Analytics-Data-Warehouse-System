@@ -504,7 +504,15 @@ CREATE TABLE IF NOT EXISTS dim_project (
     end_date         DATE,
     project_status   VARCHAR(30),
     budget           DECIMAL(15,2),
-    UNIQUE KEY uq_dim_project_source (project_id)
+    UNIQUE KEY uq_dim_project_source (project_id),
+    CONSTRAINT chk_project_dates
+       CHECK (
+    end_date IS NULL
+    OR start_date IS NULL
+    OR end_date >= start_date
+     ),
+   CONSTRAINT chk_project_budget
+   CHECK (budget IS NULL OR budget >= 0)
 ) ENGINE=InnoDB;
 
 
@@ -566,7 +574,9 @@ CREATE TABLE IF NOT EXISTS dim_employee (
     INDEX idx_dim_employee_asof (employee_number, start_date, end_date),
     INDEX idx_dim_employee_current (employee_number, is_current),
     CONSTRAINT chk_dim_employee_dates
-        CHECK (end_date >= start_date)
+        CHECK (end_date >= start_date),
+	CONSTRAINT uq_employee_version
+         UNIQUE (employee_number, start_date)
 ) ENGINE=InnoDB;
 
 
@@ -597,7 +607,6 @@ CREATE TABLE IF NOT EXISTS fact_performance_reviews (
     CONSTRAINT chk_fact_review_score
         CHECK (review_score IS NULL OR (review_score >= 0 AND review_score <= 100))
 ) ENGINE=InnoDB;
-
 
 -- =============================================================================
 -- EXISTING DATABASE MIGRATION NOTE (IMPORTANT)
@@ -841,6 +850,411 @@ FROM hr_oltp.assignments a
 JOIN hr_oltp.employees e ON e.employee_id = a.employee_id
 GROUP BY e.employee_number
 HAVING SUM(a.allocation_pct) > 100;
+
+
+/*
+Enterprise Employee Analytics & Data Warehouse System
+Advanced SQL: CTEs, Window Functions, Stored Procedures
+
+Updated OLAP schema:
+  dim_employee, dim_project, dim_date, dim_department
+  fact_performance_reviews (the only fact table)
+
+Fact grain: one row per performance review.
+department_sk in the fact represents the employee's department at review time.
+dim_employee is SCD Type 2; employee_sk identifies a specific historical version.
+*/
+
+USE hr_dw;
+
+-- 1. Department-wise performance summary
+SELECT d.department_name, COUNT(*) AS total_reviews,
+       ROUND(AVG(f.review_score), 2) AS average_review_score,
+       ROUND(AVG(f.performance_rating), 2) AS average_performance_rating
+FROM fact_performance_reviews f
+JOIN dim_department d ON f.department_sk = d.department_sk
+GROUP BY d.department_sk, d.department_name
+ORDER BY average_review_score DESC;
+
+-- 2. Year-wise review volume and average performance
+SELECT dt.year_number, COUNT(*) AS total_reviews,
+       ROUND(AVG(f.review_score), 2) AS average_review_score
+FROM fact_performance_reviews f
+JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+GROUP BY dt.year_number
+ORDER BY dt.year_number;
+
+-- 3. Project-wise performance summary
+SELECT p.project_id, p.project_name, COUNT(*) AS total_reviews,
+       ROUND(AVG(f.review_score), 2) AS average_review_score,
+       MAX(f.review_score) AS highest_score, MIN(f.review_score) AS lowest_score
+FROM fact_performance_reviews f
+JOIN dim_project p ON f.project_sk = p.project_sk
+GROUP BY p.project_id, p.project_name
+ORDER BY average_review_score DESC;
+
+-- 4. Performance-rating distribution
+SELECT performance_rating, COUNT(*) AS total_reviews,
+       ROUND(100.0 * COUNT(*) /
+             NULLIF((SELECT COUNT(*) FROM fact_performance_reviews), 0), 2) AS percentage
+FROM fact_performance_reviews
+GROUP BY performance_rating
+ORDER BY performance_rating;
+
+-- 5. Department-wise job satisfaction
+SELECT d.department_name, COUNT(*) AS total_reviews,
+       ROUND(AVG(f.job_satisfaction), 2) AS average_job_satisfaction
+FROM fact_performance_reviews f
+JOIN dim_department d ON f.department_sk = d.department_sk
+GROUP BY d.department_sk, d.department_name
+ORDER BY average_job_satisfaction DESC;
+
+-- 6. Monthly performance trend
+SELECT dt.year_number, dt.month_number, dt.month_name,
+       COUNT(*) AS total_reviews, ROUND(AVG(f.review_score), 2) AS average_score
+FROM fact_performance_reviews f
+JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+GROUP BY dt.year_number, dt.month_number, dt.month_name
+ORDER BY dt.year_number, dt.month_number;
+
+-- 7. Employees whose average score is above the company average (CTE)
+WITH employee_performance AS (
+    SELECT e.employee_number, e.employee_name, f.department_sk,
+           COUNT(*) AS review_count, AVG(f.review_score) AS employee_average
+    FROM fact_performance_reviews f
+    JOIN dim_employee e ON f.employee_sk = e.employee_sk
+    GROUP BY e.employee_number, e.employee_name, f.department_sk
+),
+company_average AS (
+    SELECT AVG(review_score) AS overall_average
+    FROM fact_performance_reviews
+)
+SELECT ep.employee_number, ep.employee_name, d.department_name,
+       ep.review_count, ROUND(ep.employee_average, 2) AS employee_average,
+       ROUND(ca.overall_average, 2) AS company_average
+FROM employee_performance ep
+JOIN dim_department d ON ep.department_sk = d.department_sk
+CROSS JOIN company_average ca
+WHERE ep.employee_average > ca.overall_average
+ORDER BY ep.employee_average DESC;
+
+-- 8. Departments performing above the company average (CTE)
+WITH department_performance AS (
+    SELECT department_sk, COUNT(*) AS total_reviews, AVG(review_score) AS department_average
+    FROM fact_performance_reviews
+    GROUP BY department_sk
+),
+company_performance AS (
+    SELECT AVG(review_score) AS company_average FROM fact_performance_reviews
+)
+SELECT d.department_name, dp.total_reviews,
+       ROUND(dp.department_average, 2) AS department_average,
+       ROUND(cp.company_average, 2) AS company_average
+FROM department_performance dp
+JOIN dim_department d ON dp.department_sk = d.department_sk
+CROSS JOIN company_performance cp
+WHERE dp.department_average > cp.company_average
+ORDER BY dp.department_average DESC;
+
+-- 9. Year-over-year performance change using LAG() (CTE + window function)
+WITH yearly_performance AS (
+    SELECT dt.year_number, COUNT(*) AS total_reviews, AVG(f.review_score) AS average_score
+    FROM fact_performance_reviews f
+    JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+    GROUP BY dt.year_number
+),
+yearly_comparison AS (
+    SELECT year_number, total_reviews, average_score,
+           LAG(average_score) OVER (ORDER BY year_number) AS previous_year_average
+    FROM yearly_performance
+)
+SELECT year_number, total_reviews,
+       ROUND(average_score, 2) AS average_score,
+       ROUND(previous_year_average, 2) AS previous_year_average,
+       ROUND(average_score - previous_year_average, 2) AS score_change,
+       ROUND(100.0 * (average_score - previous_year_average) /
+             NULLIF(previous_year_average, 0), 2) AS percentage_change
+FROM yearly_comparison
+ORDER BY year_number;
+
+-- 10. Reviews above their department's average score (CTE)
+WITH department_average AS (
+    SELECT department_sk, AVG(review_score) AS average_score
+    FROM fact_performance_reviews
+    GROUP BY department_sk
+)
+SELECT e.employee_number, e.employee_name, d.department_name,
+       f.review_score, ROUND(da.average_score, 2) AS department_average
+FROM fact_performance_reviews f
+JOIN dim_employee e ON f.employee_sk = e.employee_sk
+JOIN dim_department d ON f.department_sk = d.department_sk
+JOIN department_average da ON f.department_sk = da.department_sk
+WHERE f.review_score > da.average_score
+ORDER BY d.department_name, f.review_score DESC;
+
+-- 11. Top-performing employees in each department using DENSE_RANK()
+-- Rank employee-level averages, not individual review rows.
+WITH employee_department_performance AS (
+    SELECT e.employee_number, e.employee_name, f.department_sk,
+           COUNT(*) AS review_count, AVG(f.review_score) AS average_score
+    FROM fact_performance_reviews f
+    JOIN dim_employee e ON f.employee_sk = e.employee_sk
+    GROUP BY e.employee_number, e.employee_name, f.department_sk
+),
+ranked_employees AS (
+    SELECT employee_number, employee_name, department_sk, review_count, average_score,
+           DENSE_RANK() OVER (
+               PARTITION BY department_sk ORDER BY average_score DESC
+           ) AS department_rank
+    FROM employee_department_performance
+)
+SELECT r.employee_number, r.employee_name, d.department_name, r.review_count,
+       ROUND(r.average_score, 2) AS average_score, r.department_rank
+FROM ranked_employees r
+JOIN dim_department d ON r.department_sk = d.department_sk
+WHERE r.department_rank <= 5
+ORDER BY d.department_name, r.department_rank, r.employee_name;
+
+-- 12. Latest review for each employee using ROW_NUMBER()
+WITH employee_reviews AS (
+    SELECT e.employee_number, e.employee_name, f.source_review_id,
+           dt.full_date AS review_date, f.review_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY e.employee_number
+               ORDER BY dt.full_date DESC, f.source_review_id DESC
+           ) AS row_num
+    FROM fact_performance_reviews f
+    JOIN dim_employee e ON f.employee_sk = e.employee_sk
+    JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+)
+SELECT employee_number, employee_name, source_review_id, review_date, review_score
+FROM employee_reviews
+WHERE row_num = 1
+ORDER BY employee_number;
+
+-- 13. Compare each employee's review with their previous review using LAG()
+WITH review_sequence AS (
+    SELECT e.employee_number, e.employee_name, dt.full_date AS review_date,
+           f.review_score,
+           LAG(f.review_score) OVER (
+               PARTITION BY e.employee_number
+               ORDER BY dt.full_date, f.source_review_id
+           ) AS previous_review_score
+    FROM fact_performance_reviews f
+    JOIN dim_employee e ON f.employee_sk = e.employee_sk
+    JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+)
+SELECT employee_number, employee_name, review_date, review_score,
+       previous_review_score, review_score - previous_review_score AS score_difference
+FROM review_sequence
+ORDER BY employee_number, review_date;
+
+-- 14. Show the next review score using LEAD()
+SELECT e.employee_number, e.employee_name, dt.full_date AS review_date,
+       f.review_score,
+       LEAD(f.review_score) OVER (
+           PARTITION BY e.employee_number
+           ORDER BY dt.full_date, f.source_review_id
+       ) AS next_review_score
+FROM fact_performance_reviews f
+JOIN dim_employee e ON f.employee_sk = e.employee_sk
+JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+ORDER BY e.employee_number, dt.full_date;
+
+-- 15. Cumulative number of reviews by department over time
+WITH daily_department_reviews AS (
+    SELECT f.department_sk, dt.full_date, COUNT(*) AS daily_reviews
+    FROM fact_performance_reviews f
+    JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+    GROUP BY f.department_sk, dt.full_date
+)
+SELECT d.department_name, x.full_date, x.daily_reviews,
+       SUM(x.daily_reviews) OVER (
+           PARTITION BY x.department_sk
+           ORDER BY x.full_date
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS cumulative_reviews
+FROM daily_department_reviews x
+JOIN dim_department d ON x.department_sk = d.department_sk
+ORDER BY d.department_name, x.full_date;
+
+-- 16. Compare each review score with the overall average using AVG() OVER()
+SELECT e.employee_number, e.employee_name, f.review_score,
+       ROUND(AVG(f.review_score) OVER (), 2) AS overall_average,
+       ROUND(f.review_score - AVG(f.review_score) OVER (), 2) AS difference_from_average
+FROM fact_performance_reviews f
+JOIN dim_employee e ON f.employee_sk = e.employee_sk;
+
+-- 17. Current attrition count and percentage by department
+-- is_current prevents historical SCD2 versions from being double-counted.
+SELECT e.department_name, COUNT(*) AS current_employee_count,
+       SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) AS attrition_count,
+       ROUND(100.0 * SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) /
+             NULLIF(COUNT(*), 0), 2) AS attrition_percentage
+FROM dim_employee e
+WHERE e.is_current = TRUE
+GROUP BY e.department_name
+ORDER BY attrition_percentage DESC;
+
+-- 18. Current attrition by job role
+SELECT e.job_role, COUNT(*) AS employee_count,
+       SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) AS attrition_count,
+       ROUND(100.0 * SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) /
+             NULLIF(COUNT(*), 0), 2) AS attrition_percentage
+FROM dim_employee e
+WHERE e.is_current = TRUE
+GROUP BY e.job_role
+ORDER BY attrition_percentage DESC;
+
+-- 19. Current attrition by overtime
+SELECT e.overtime, COUNT(*) AS employee_count,
+       SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) AS attrition_count,
+       ROUND(100.0 * SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) /
+             NULLIF(COUNT(*), 0), 2) AS attrition_percentage
+FROM dim_employee e
+WHERE e.is_current = TRUE
+GROUP BY e.overtime
+ORDER BY attrition_percentage DESC;
+
+-- 20. Current attrition by job satisfaction
+SELECT e.job_satisfaction, COUNT(*) AS employee_count,
+       SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) AS attrition_count,
+       ROUND(100.0 * SUM(CASE WHEN LOWER(e.attrition) = 'yes' THEN 1 ELSE 0 END) /
+             NULLIF(COUNT(*), 0), 2) AS attrition_percentage
+FROM dim_employee e
+WHERE e.is_current = TRUE
+GROUP BY e.job_satisfaction
+ORDER BY e.job_satisfaction;
+
+-- 21. Inspect all SCD2 versions of one employee (replace sample employee number)
+SELECT employee_number, employee_name, department_name, job_role, job_level,
+       monthly_income, start_date, end_date, is_current, change_reason
+FROM dim_employee
+WHERE employee_number = 1001
+ORDER BY start_date;
+
+-- 22. Find employees with more than one current SCD2 version (expected: no rows)
+SELECT employee_number, COUNT(*) AS current_version_count
+FROM dim_employee
+WHERE is_current = TRUE
+GROUP BY employee_number
+HAVING COUNT(*) > 1;
+
+-- 23. Check current flag and end-date consistency (sentinel: 2099-12-31)
+SELECT employee_number, start_date, end_date, is_current
+FROM dim_employee
+WHERE (is_current = TRUE AND end_date <> '2099-12-31')
+   OR (is_current = FALSE AND end_date = '2099-12-31');
+
+-- 24. Find overlapping SCD2 effective date ranges (expected: no rows)
+SELECT a.employee_number,
+       a.employee_sk AS version_1, b.employee_sk AS version_2,
+       a.start_date AS version_1_start, a.end_date AS version_1_end,
+       b.start_date AS version_2_start, b.end_date AS version_2_end
+FROM dim_employee a
+JOIN dim_employee b
+  ON a.employee_number = b.employee_number
+ AND a.employee_sk < b.employee_sk
+ AND a.start_date <= b.end_date
+ AND b.start_date <= a.end_date;
+
+-- 25. Create a reusable review-level employee performance view
+CREATE OR REPLACE VIEW vw_employee_performance AS
+SELECT e.employee_number, e.employee_name, d.department_name,
+       p.project_name, dt.full_date AS review_date,
+       f.performance_rating, f.job_satisfaction, f.review_score
+FROM fact_performance_reviews f
+JOIN dim_employee e ON f.employee_sk = e.employee_sk
+JOIN dim_department d ON f.department_sk = d.department_sk
+JOIN dim_project p ON f.project_sk = p.project_sk
+JOIN dim_date dt ON f.review_date_sk = dt.date_sk;
+
+-- 26. Read the view
+SELECT *
+FROM vw_employee_performance
+ORDER BY review_date DESC
+LIMIT 20;
+
+-- 27-29. Stored procedures
+-- Run this section in MySQL Workbench with delimiter handling enabled.
+DELIMITER //
+
+DROP PROCEDURE IF EXISTS GetDepartmentPerformance//
+CREATE PROCEDURE GetDepartmentPerformance(IN p_department_sk INT)
+BEGIN
+    SELECT d.department_name, COUNT(*) AS total_reviews,
+           ROUND(AVG(f.review_score), 2) AS average_score,
+           MAX(f.review_score) AS highest_score,
+           MIN(f.review_score) AS lowest_score
+    FROM dim_department d
+    JOIN fact_performance_reviews f ON d.department_sk = f.department_sk
+    WHERE d.department_sk = p_department_sk
+    GROUP BY d.department_sk, d.department_name;
+END//
+
+DROP PROCEDURE IF EXISTS GetTotalReviews//
+CREATE PROCEDURE GetTotalReviews(OUT p_total_reviews BIGINT)
+BEGIN
+    SELECT COUNT(*) INTO p_total_reviews
+    FROM fact_performance_reviews;
+END//
+
+DROP PROCEDURE IF EXISTS GetYearlyPerformance//
+CREATE PROCEDURE GetYearlyPerformance(IN p_year INT)
+BEGIN
+    SELECT dt.year_number, COUNT(*) AS total_reviews,
+           ROUND(AVG(f.review_score), 2) AS average_score
+    FROM fact_performance_reviews f
+    JOIN dim_date dt ON f.review_date_sk = dt.date_sk
+    WHERE dt.year_number = p_year
+    GROUP BY dt.year_number;
+END//
+DELIMITER ;
+
+-- 30. Call stored procedures (use values that exist in your warehouse)
+CALL GetDepartmentPerformance(1);
+CALL GetTotalReviews(@total_reviews);
+SELECT @total_reviews AS total_reviews;
+CALL GetYearlyPerformance(2026);
+
+-- 31. Inspect indexes
+SHOW INDEX FROM fact_performance_reviews;
+
+-- 32. Explain department filtering
+EXPLAIN
+SELECT employee_sk, department_sk, review_score
+FROM fact_performance_reviews
+WHERE department_sk = 1;
+
+-- 33. Analyze department aggregation (executes the query)
+EXPLAIN ANALYZE
+SELECT department_sk, AVG(review_score)
+FROM fact_performance_reviews
+GROUP BY department_sk;
+
+-- 34. Check review-score range (expected: no rows)
+SELECT *
+FROM fact_performance_reviews
+WHERE review_score < 0 OR review_score > 100;
+
+-- 35. Compare fact row count with distinct source review count
+SELECT COUNT(*) AS total_fact_rows,
+       COUNT(DISTINCT source_review_id) AS distinct_source_reviews
+FROM fact_performance_reviews;
+
+-- 36. Current employees without a performance review
+SELECT e.employee_number, e.employee_name, e.department_name
+FROM dim_employee e
+WHERE e.is_current = TRUE
+  AND NOT EXISTS (
+      SELECT 1
+      FROM fact_performance_reviews f
+      WHERE f.employee_sk = e.employee_sk
+  )
+ORDER BY e.employee_number;
+
+
+
 
 
 -- =============================================================================
