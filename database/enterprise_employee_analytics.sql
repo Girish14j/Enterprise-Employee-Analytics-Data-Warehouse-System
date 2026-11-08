@@ -1,3 +1,30 @@
+-- =============================================================================
+-- ENTERPRISE EMPLOYEE ANALYTICS & DATA WAREHOUSE SYSTEM
+-- Master SQL file | MySQL 8.0+
+--
+-- Databases:
+--   1. hr_staging : imported CSV data
+--   2. hr_oltp    : normalized operational data
+--   3. hr_dw      : dimensional data warehouse
+--
+-- IMPORTANT EXECUTION WORKFLOW
+--   A. Execute Sections 1-2 to create databases and staging tables.
+--   B. Import the five CSV files into the matching staging tables using
+--      MySQL Workbench's Table Data Import Wizard.
+--   C. Execute Section 3 to populate normalized OLTP tables.
+--   D. Execute Section 4 to create/populate warehouse dimensions and facts.
+--
+-- Run this file on MySQL 8.0+. It is designed to be rerunnable for table
+-- creation, but data-loading INSERT statements should be reviewed before
+-- rerunning to avoid duplicate or unintended data.
+--
+-- Source assumptions confirmed by the team:
+--   * EmployeeNumber is consistent across all five CSV files.
+--   * One assignment row exists per employee-project pair.
+--   * Salary history is represented in employee_scd2_history.csv and
+--     Dim_Employee SCD Type 2; no separate OLTP Salary_History table.
+-- =============================================================================
+
 
 -- =============================================================================
 -- SECTION 1: DATABASES
@@ -112,7 +139,6 @@ CREATE TABLE IF NOT EXISTS stg_employee_scd2_history (
     end_date                    DATE NOT NULL,
     is_current                  BOOLEAN NOT NULL,
     change_reason               VARCHAR(100),
-    PRIMARY KEY (employee_number, start_date),
     INDEX idx_stg_history_employee (employee_number),
     INDEX idx_stg_history_dates (start_date, end_date),
     INDEX idx_stg_history_current (employee_number, is_current)
@@ -362,50 +388,21 @@ SELECT
     s.employee_number,
     COALESCE(s.synthetic_employee_name, CONCAT('Employee ', s.employee_number)),
     COALESCE(s.synthetic_employee_email, CONCAT('employee', s.employee_number, '@example.invalid')),
-    s.age,
-    s.gender,
-    s.marital_status,
-    s.education,
-    s.education_field,
-    d.department_id,
-    j.job_role_id,
-    s.job_level,
-    s.synthetic_hire_date,
-    s.attrition,
-    s.business_travel,
-    s.daily_rate,
-    s.distance_from_home,
-    s.environment_satisfaction,
-    s.hourly_rate,
-    s.job_involvement,
-    s.job_satisfaction,
-    s.monthly_income,
-    s.monthly_rate,
-    s.num_companies_worked,
-    s.overtime,
-    s.percent_salary_hike,
-    s.performance_rating,
-    s.relationship_satisfaction,
-    s.stock_option_level,
-    s.total_working_years,
-    s.training_times_last_year,
-    s.work_life_balance,
-    s.years_at_company,
-    s.years_in_current_role,
-    s.years_since_last_promotion,
+    s.age, s.gender, s.marital_status, s.education, s.education_field,
+    d.department_id, j.job_role_id, s.job_level, s.synthetic_hire_date,
+    s.attrition, s.business_travel, s.daily_rate, s.distance_from_home,
+    s.environment_satisfaction, s.hourly_rate, s.job_involvement,
+    s.job_satisfaction, s.monthly_income, s.monthly_rate,
+    s.num_companies_worked, s.overtime, s.percent_salary_hike,
+    s.performance_rating, s.relationship_satisfaction, s.stock_option_level,
+    s.total_working_years, s.training_times_last_year, s.work_life_balance,
+    s.years_at_company, s.years_in_current_role, s.years_since_last_promotion,
     s.years_with_curr_manager,
-    CASE
-        WHEN UPPER(COALESCE(s.attrition, 'NO')) = 'YES'
-        THEN 'Terminated'
-        ELSE 'Active'
-    END
+    CASE WHEN UPPER(COALESCE(s.attrition, 'NO')) = 'YES'
+         THEN 'Terminated' ELSE 'Active' END
 FROM hr_staging.stg_employee_snapshot s
-JOIN departments d
-    ON d.department_name COLLATE utf8mb4_unicode_ci
-       = TRIM(s.department) COLLATE utf8mb4_unicode_ci
-JOIN job_roles j
-    ON j.job_title COLLATE utf8mb4_unicode_ci
-       = TRIM(s.job_role) COLLATE utf8mb4_unicode_ci
+JOIN departments d ON d.department_name = TRIM(s.department)
+JOIN job_roles j ON j.job_title = TRIM(s.job_role)
 ON DUPLICATE KEY UPDATE
     employee_name = VALUES(employee_name),
     email = VALUES(email),
@@ -422,17 +419,10 @@ INSERT INTO projects (
     project_status, budget
 )
 SELECT
-    p.project_id,
-    p.project_name,
-    d.department_id,
-    p.start_date,
-    p.end_date,
-    p.status,
-    p.budget
+    p.project_id, p.project_name, d.department_id, p.start_date, p.end_date,
+    p.status, p.budget
 FROM hr_staging.stg_projects p
-JOIN departments d
-    ON d.department_name COLLATE utf8mb4_unicode_ci
-       = TRIM(p.department) COLLATE utf8mb4_unicode_ci
+JOIN departments d ON d.department_name = TRIM(p.department)
 ON DUPLICATE KEY UPDATE
     project_name = VALUES(project_name),
     department_id = VALUES(department_id),
@@ -487,8 +477,10 @@ ON DUPLICATE KEY UPDATE
 -- Dimensions:
 --   Dim_Employee   : SCD Type 2; one row per employee version.
 --   Dim_Department : one row per department.
---   Dim_Project    : one row per project.
+--   Dim_Project    : one row per project, with department_name as a descriptive attribute.
 --   Dim_Date       : one row per calendar date.
+-- Pure star-schema rule: dimensions do not have foreign keys to other dimensions.
+-- All four dimensions connect directly to Fact_PerformanceReviews.
 --
 -- Surrogate keys are generated in every dimension.
 -- =============================================================================
@@ -507,15 +499,12 @@ CREATE TABLE IF NOT EXISTS dim_project (
     project_sk       BIGINT AUTO_INCREMENT PRIMARY KEY,
     project_id       INT NOT NULL,
     project_name     VARCHAR(150) NOT NULL,
-    department_sk    INT NOT NULL,
+    department_name  VARCHAR(100),
     start_date       DATE,
     end_date         DATE,
     project_status   VARCHAR(30),
     budget           DECIMAL(15,2),
-    UNIQUE KEY uq_dim_project_source (project_id),
-    INDEX idx_dim_project_department (department_sk),
-    CONSTRAINT fk_dim_project_department
-        FOREIGN KEY (department_sk) REFERENCES dim_department(department_sk)
+    UNIQUE KEY uq_dim_project_source (project_id)
 ) ENGINE=InnoDB;
 
 
@@ -542,7 +531,7 @@ CREATE TABLE IF NOT EXISTS dim_employee (
     attrition                   VARCHAR(5),
     business_travel             VARCHAR(30),
     daily_rate                  SMALLINT UNSIGNED,
-    department_sk               INT NOT NULL,
+    department_name             VARCHAR(100) NOT NULL,
     distance_from_home          TINYINT UNSIGNED,
     education                   TINYINT UNSIGNED,
     education_field             VARCHAR(100),
@@ -576,8 +565,6 @@ CREATE TABLE IF NOT EXISTS dim_employee (
     INDEX idx_dim_employee_business_key (employee_number),
     INDEX idx_dim_employee_asof (employee_number, start_date, end_date),
     INDEX idx_dim_employee_current (employee_number, is_current),
-    CONSTRAINT fk_dim_employee_department
-        FOREIGN KEY (department_sk) REFERENCES dim_department(department_sk),
     CONSTRAINT chk_dim_employee_dates
         CHECK (end_date >= start_date)
 ) ENGINE=InnoDB;
@@ -613,15 +600,49 @@ CREATE TABLE IF NOT EXISTS fact_performance_reviews (
 
 
 -- =============================================================================
+-- EXISTING DATABASE MIGRATION NOTE (IMPORTANT)
+-- =============================================================================
+-- The CREATE TABLE IF NOT EXISTS statements above do NOT alter tables that
+-- already exist. If hr_dw was created using the previous snowflake-style
+-- version of this file, back up hr_dw and run the following one-time migration
+-- BEFORE running Section 4A. Do NOT run this migration on a fresh database.
+--
+-- ALTER TABLE hr_dw.dim_project ADD COLUMN department_name VARCHAR(100) NULL;
+-- UPDATE hr_dw.dim_project dp
+-- JOIN hr_dw.dim_department dd ON dd.department_sk = dp.department_sk
+-- SET dp.department_name = dd.department_name;
+-- ALTER TABLE hr_dw.dim_project MODIFY department_name VARCHAR(100) NULL;
+-- ALTER TABLE hr_dw.dim_project DROP FOREIGN KEY fk_dim_project_department;
+-- ALTER TABLE hr_dw.dim_project DROP INDEX idx_dim_project_department;
+-- ALTER TABLE hr_dw.dim_project DROP COLUMN department_sk;
+--
+-- ALTER TABLE hr_dw.dim_employee ADD COLUMN department_name VARCHAR(100) NULL
+-- AFTER daily_rate;
+-- UPDATE hr_dw.dim_employee de
+-- JOIN hr_dw.dim_department dd ON dd.department_sk = de.department_sk
+-- SET de.department_name = dd.department_name;
+-- ALTER TABLE hr_dw.dim_employee MODIFY department_name VARCHAR(100) NOT NULL;
+-- ALTER TABLE hr_dw.dim_employee DROP FOREIGN KEY fk_dim_employee_department;
+-- ALTER TABLE hr_dw.dim_employee DROP COLUMN department_sk;
+--
+-- Verify department_name has no NULL values before making it NOT NULL. If the
+-- old constraint/index names differ, inspect SHOW CREATE TABLE first.
+-- The migration is deliberately commented out so a clean installation does
+-- not try to alter columns that do not exist.
+-- =============================================================================
+
+
+-- =============================================================================
 -- SECTION 4A: LOAD WAREHOUSE DIMENSIONS FROM OLTP / SCD2 STAGING
 --
 -- Execute after Section 3A has populated OLTP and after CSVs are imported.
 -- The SCD2 history source is loaded into Dim_Employee with its original
 -- start_date, end_date, is_current and change_reason values.
 --
--- The department dimension is loaded first because employee/project dimensions
--- reference it. Project dimension follows. Date dimension is populated from
--- review dates. The fact load uses the employee version valid on ReviewDate.
+-- Each dimension is loaded independently. Department names are retained as
+-- descriptive attributes in employee/project dimensions; there are no
+-- dimension-to-dimension foreign keys. The fact table resolves department_sk
+-- independently and references every dimension directly.
 --
 -- Validate that each employee has exactly one current SCD2 row and that
 -- historical intervals do not overlap before executing.
@@ -636,18 +657,17 @@ ON DUPLICATE KEY UPDATE department_name = VALUES(department_name);
 
 -- Load project dimension.
 INSERT INTO dim_project (
-    project_id, project_name, department_sk, start_date, end_date,
+    project_id, project_name, department_name, start_date, end_date,
     project_status, budget
 )
 SELECT
-    p.project_id, p.project_name, dd.department_sk, p.start_date, p.end_date,
+    p.project_id, p.project_name, od.department_name, p.start_date, p.end_date,
     p.project_status, p.budget
 FROM hr_oltp.projects p
 JOIN hr_oltp.departments od ON od.department_id = p.department_id
-JOIN dim_department dd ON dd.department_name = od.department_name
 ON DUPLICATE KEY UPDATE
     project_name = VALUES(project_name),
-    department_sk = VALUES(department_sk),
+    department_name = VALUES(department_name),
     start_date = VALUES(start_date),
     end_date = VALUES(end_date),
     project_status = VALUES(project_status),
@@ -658,9 +678,9 @@ ON DUPLICATE KEY UPDATE
 -- This is an initial historical load. Do not truncate Dim_Employee in routine
 -- refreshes. The NOT EXISTS check prevents duplicate versions with the same
 -- employee key and validity start date.
-INSERT INTO hr_dw.dim_employee (
+INSERT INTO dim_employee (
     employee_number, employee_name, employee_email, age, attrition,
-    business_travel, daily_rate, department_sk, distance_from_home,
+    business_travel, daily_rate, department_name, distance_from_home,
     education, education_field, gender, hourly_rate, job_involvement,
     job_level, job_role, job_satisfaction, marital_status, monthly_income,
     monthly_rate, num_companies_worked, overtime, percent_salary_hike,
@@ -671,51 +691,21 @@ INSERT INTO hr_dw.dim_employee (
     is_current, change_reason
 )
 SELECT
-    h.employee_number,
-    h.synthetic_employee_name,
-    h.synthetic_employee_email,
-    h.age,
-    h.attrition,
-    h.business_travel,
-    h.daily_rate,
-    dd.department_sk,
-    h.distance_from_home,
-    h.education,
-    h.education_field,
-    h.gender,
-    h.hourly_rate,
-    h.job_involvement,
-    h.job_level,
-    h.job_role,
-    h.job_satisfaction,
-    h.marital_status,
-    h.monthly_income,
-    h.monthly_rate,
-    h.num_companies_worked,
-    h.overtime,
-    h.percent_salary_hike,
-    h.performance_rating,
-    h.relationship_satisfaction,
-    h.stock_option_level,
-    h.total_working_years,
-    h.training_times_last_year,
-    h.work_life_balance,
-    h.years_at_company,
-    h.years_in_current_role,
-    h.years_since_last_promotion,
-    h.years_with_curr_manager,
-    h.synthetic_hire_date,
-    h.start_date,
-    h.end_date,
-    h.is_current,
-    h.change_reason
+    h.employee_number, h.synthetic_employee_name, h.synthetic_employee_email,
+    h.age, h.attrition, h.business_travel, h.daily_rate, TRIM(h.department),
+    h.distance_from_home, h.education, h.education_field, h.gender,
+    h.hourly_rate, h.job_involvement, h.job_level, h.job_role,
+    h.job_satisfaction, h.marital_status, h.monthly_income, h.monthly_rate,
+    h.num_companies_worked, h.overtime, h.percent_salary_hike,
+    h.performance_rating, h.relationship_satisfaction, h.stock_option_level,
+    h.total_working_years, h.training_times_last_year, h.work_life_balance,
+    h.years_at_company, h.years_in_current_role, h.years_since_last_promotion,
+    h.years_with_curr_manager, h.synthetic_hire_date, h.start_date, h.end_date,
+    h.is_current, h.change_reason
 FROM hr_staging.stg_employee_scd2_history h
-JOIN hr_dw.dim_department dd
-    ON dd.department_name COLLATE utf8mb4_unicode_ci
-       = TRIM(h.department) COLLATE utf8mb4_unicode_ci
 WHERE NOT EXISTS (
     SELECT 1
-    FROM hr_dw.dim_employee existing
+    FROM dim_employee existing
     WHERE existing.employee_number = h.employee_number
       AND existing.start_date = h.start_date
 );
@@ -750,7 +740,7 @@ SELECT
     r.review_id,
     de.employee_sk,
     dp.project_sk,
-    de.department_sk,
+    dd.department_sk,
     CAST(DATE_FORMAT(r.review_date, '%Y%m%d') AS UNSIGNED),
     r.performance_rating,
     r.job_satisfaction,
@@ -763,6 +753,7 @@ JOIN dim_employee de
  AND r.review_date >= de.start_date
  AND r.review_date <= de.end_date
 JOIN dim_project dp ON dp.project_id = r.project_id
+JOIN dim_department dd ON dd.department_name = de.department_name
 ON DUPLICATE KEY UPDATE
     employee_sk = VALUES(employee_sk),
     project_sk = VALUES(project_sk),
@@ -810,6 +801,15 @@ UNION ALL SELECT 'dim_project', COUNT(*) FROM hr_dw.dim_project
 UNION ALL SELECT 'dim_employee', COUNT(*) FROM hr_dw.dim_employee
 UNION ALL SELECT 'dim_date', COUNT(*) FROM hr_dw.dim_date
 UNION ALL SELECT 'fact_performance_reviews', COUNT(*) FROM hr_dw.fact_performance_reviews;
+
+
+-- Star-schema structural check: dimensions should not contain FKs to dimensions.
+-- The expected dimension FKs exist only on fact_performance_reviews.
+SELECT TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = 'hr_dw'
+  AND REFERENCED_TABLE_NAME IS NOT NULL
+ORDER BY TABLE_NAME, CONSTRAINT_NAME;
 
 
 -- Check that each employee has exactly one current SCD2 version.
