@@ -126,7 +126,7 @@ class AnalyticsManager(BaseManager):
         """Attrition rate of the CURRENT employee versions by department or job role."""
         if not self.attrition_available:
             return pd.DataFrame(columns=["grp", "headcount", "leavers", "attrition_rate"])
-        expr = "de.job_role" if group == "job_role" else "d.department_name"
+        expr = "de.job_role" if group == "job_role" else "de.department_name"
         df = self.fetch_df(
             f"""
             SELECT {expr} AS grp,
@@ -134,7 +134,6 @@ class AnalyticsManager(BaseManager):
                    SUM(CASE WHEN UPPER(CAST(de.attrition AS CHAR)) IN ('YES','Y','1','TRUE')
                             THEN 1 ELSE 0 END) AS leavers
             FROM {_E} de
-            JOIN {_D} d ON d.department_sk = de.department_sk
             WHERE de.is_current = 1
             GROUP BY {expr}
             ORDER BY leavers DESC
@@ -157,15 +156,15 @@ class AnalyticsManager(BaseManager):
             ),
             latest AS (SELECT * FROM review_seq WHERE rn = 1),
             current_emp AS (
-                SELECT de.employee_number, de.employee_name, de.department_sk, de.job_role, de.monthly_income,
-                       AVG(de.monthly_income) OVER (PARTITION BY de.department_sk) AS dept_avg_income
+                SELECT de.employee_number, de.employee_name, de.department_name, de.job_role, de.monthly_income,
+                       AVG(de.monthly_income) OVER (PARTITION BY de.department_name) AS dept_avg_income
                 FROM {_E} de WHERE de.is_current = 1 {leaver}
             ),
             dept_score AS (
                 SELECT department_sk, AVG(review_score) AS dept_avg_score FROM {_F} GROUP BY department_sk
             ),
             scored AS (
-                SELECT ce.employee_number, ce.employee_name, ce.department_sk, d.department_name, ce.job_role,
+                SELECT ce.employee_number, ce.employee_name, d.department_sk, d.department_name, ce.job_role,
                        l.review_score AS last_score, l.prev_score, l.job_satisfaction AS last_satisfaction,
                        ce.monthly_income,
                        (CASE WHEN l.job_satisfaction <= 2 THEN 40 ELSE 0 END
@@ -175,8 +174,8 @@ class AnalyticsManager(BaseManager):
                       + CASE WHEN ce.monthly_income < 0.8 * ce.dept_avg_income THEN 20 ELSE 0 END) AS risk_score
                 FROM current_emp ce
                 JOIN latest l      ON l.employee_number = ce.employee_number
-                JOIN {_D} d        ON d.department_sk = ce.department_sk
-                JOIN dept_score ds ON ds.department_sk = ce.department_sk
+                JOIN {_D} d        ON d.department_name = ce.department_name
+                JOIN dept_score ds ON ds.department_sk = d.department_sk
             ),
             banded AS (
                 SELECT s.*, CASE WHEN s.risk_score <= 20 THEN 'Low'
@@ -212,7 +211,7 @@ class AnalyticsManager(BaseManager):
         return self.fetch_df(
             f"""
             WITH project_stats AS (
-                SELECT p.project_sk, p.project_id, p.project_name, d.department_name, p.project_status,
+                SELECT p.project_sk, p.project_id, p.project_name, p.department_name, p.project_status,
                        p.start_date, p.end_date, p.budget,
                        COUNT(f.fact_review_sk)             AS review_count,
                        COUNT(DISTINCT de.employee_number)  AS reviewed_employees,
@@ -221,10 +220,9 @@ class AnalyticsManager(BaseManager):
                        CASE WHEN p.end_date IS NOT NULL AND p.end_date < CURDATE()
                                  AND LOWER(p.project_status) NOT IN {_CLOSED} THEN 1 ELSE 0 END AS is_overdue
                 FROM {_P} p
-                JOIN {_D} d ON d.department_sk = p.department_sk
                 LEFT JOIN {_F} f ON f.project_sk = p.project_sk
                 LEFT JOIN {_E} de ON de.employee_sk = f.employee_sk
-                GROUP BY p.project_sk, p.project_id, p.project_name, d.department_name, p.project_status,
+                GROUP BY p.project_sk, p.project_id, p.project_name, p.department_name, p.project_status,
                          p.start_date, p.end_date, p.budget
             ),
             ranked AS (
@@ -249,9 +247,9 @@ class AnalyticsManager(BaseManager):
     def employee_history(self, employee_number: int) -> pd.DataFrame:
         return self.fetch_df(
             f"""
-            SELECT de.employee_sk, de.employee_number, de.employee_name, d.department_name, de.job_role,
+            SELECT de.employee_sk, de.employee_number, de.employee_name, de.department_name, de.job_role,
                    de.job_level, de.monthly_income, de.start_date, de.end_date, de.is_current, de.change_reason
-            FROM {_E} de JOIN {_D} d ON d.department_sk = de.department_sk
+            FROM {_E} de
             WHERE de.employee_number = :n
             ORDER BY de.start_date, de.employee_sk
             """, {"n": employee_number})
