@@ -8,11 +8,15 @@ Pipeline order (each step is idempotent - running twice changes nothing):
     4. EmployeeSCD2Loader    hr_oltp.employees            -> dim_employee        (Type 2)
     5. FactLoader            hr_oltp.performance_reviews  -> fact_performance_reviews
 
+Pure star schema: dim_employee and dim_project store ``department_name`` directly (no foreign key
+to dim_department).  Only the fact table holds ``department_sk``; the fact loader resolves it from the
+employee version's department name.
+
 All SQL is set-based (no row-by-row Python), so it scales to 100k+ rows.  No table is
 ever dropped, truncated or replaced.  Everything for one run happens in ONE transaction.
 
 SCD Type 2 rules (match the generator + DDL in the project doc)
-    * tracked attributes : department, job_role, job_level, monthly_income
+    * tracked attributes : department_name, job_role, job_level, monthly_income
     * old row            : end_date = change_date - 1 day, is_current = 0
     * new row            : NEW employee_sk, start_date = change_date,
                            end_date = 2099-12-31, is_current = 1, change_reason filled
@@ -35,6 +39,18 @@ from src.exceptions import DatabaseError, ETLError
 logger = logging.getLogger(__name__)
 
 HIGH_DATE = "2099-12-31"
+
+# hr_oltp and hr_dw can store text with different collations (the new hr_dw tables use the server default,
+# utf8mb4_0900_ai_ci, while hr_oltp may use utf8mb4_unicode_ci).  Comparing such columns raises MySQL error
+# 1267 "Illegal mix of collations".  An explicit COLLATE on one operand always wins, so every text comparison
+# that crosses the two schemas goes through ``ci()``.  Numeric / date comparisons never need it.
+COLLATION = "utf8mb4_unicode_ci"
+TEXT_TYPES = {"char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"}
+
+
+def ci(expr: str) -> str:
+    """Return ``expr`` with the pipeline's explicit collation (text expressions only)."""
+    return f"{expr} COLLATE {COLLATION}"
 TRANSIENT_MYSQL_CODES = {1205, 1213, 2006, 2013}  # lock wait, deadlock, server gone away, lost connection
 
 
@@ -87,12 +103,12 @@ class DepartmentDimLoader(BaseLoader):
             SELECT d.department_name, d.department_id
             FROM {OLTP_SCHEMA}.departments d
             WHERE NOT EXISTS (SELECT 1 FROM {DW_SCHEMA}.dim_department x
-                              WHERE x.department_name = d.department_name)
+                              WHERE x.department_name = {ci('d.department_name')})
             """, conn=conn)
         report.updated = self.execute(
             f"""
             UPDATE {DW_SCHEMA}.dim_department dd
-            JOIN {OLTP_SCHEMA}.departments d ON d.department_name = dd.department_name
+            JOIN {OLTP_SCHEMA}.departments d ON {ci('d.department_name')} = dd.department_name
             SET dd.source_department_id = d.department_id
             WHERE NOT (dd.source_department_id <=> d.department_id)
             """, conn=conn)
@@ -112,12 +128,11 @@ class ProjectDimLoader(BaseLoader):
         report.inserted = self.execute(
             f"""
             INSERT INTO {DW_SCHEMA}.dim_project
-                (project_id, project_name, department_sk, start_date, end_date, project_status, budget)
-            SELECT p.project_id, p.project_name, dd.department_sk, p.start_date, p.end_date,
+                (project_id, project_name, department_name, start_date, end_date, project_status, budget)
+            SELECT p.project_id, p.project_name, od.department_name, p.start_date, p.end_date,
                    p.project_status, p.budget
             FROM {OLTP_SCHEMA}.projects p
             JOIN {OLTP_SCHEMA}.departments od ON od.department_id = p.department_id
-            JOIN {DW_SCHEMA}.dim_department dd ON dd.department_name = od.department_name
             WHERE NOT EXISTS (SELECT 1 FROM {DW_SCHEMA}.dim_project x WHERE x.project_id = p.project_id) {flt}
             """, params, conn)
         report.updated = self.execute(
@@ -125,13 +140,13 @@ class ProjectDimLoader(BaseLoader):
             UPDATE {DW_SCHEMA}.dim_project dp
             JOIN {OLTP_SCHEMA}.projects p ON p.project_id = dp.project_id
             JOIN {OLTP_SCHEMA}.departments od ON od.department_id = p.department_id
-            JOIN {DW_SCHEMA}.dim_department dd ON dd.department_name = od.department_name
-            SET dp.project_name = p.project_name, dp.department_sk = dd.department_sk,
+            SET dp.project_name = p.project_name, dp.department_name = od.department_name,
                 dp.start_date = p.start_date, dp.end_date = p.end_date,
                 dp.project_status = p.project_status, dp.budget = p.budget
-            WHERE NOT (dp.project_name <=> p.project_name AND dp.department_sk <=> dd.department_sk
+            WHERE NOT (dp.project_name <=> {ci('p.project_name')}
+                       AND dp.department_name <=> {ci('od.department_name')}
                        AND dp.start_date <=> p.start_date AND dp.end_date <=> p.end_date
-                       AND dp.project_status <=> p.project_status AND dp.budget <=> p.budget) {flt}
+                       AND dp.project_status <=> {ci('p.project_status')} AND dp.budget <=> p.budget) {flt}
             """, params, conn)
         return report
 
@@ -166,7 +181,7 @@ class EmployeeSCD2Loader(BaseLoader):
     step_name = "dim_employee (SCD2)"
 
     # dim_employee columns handled explicitly; everything else is copied / refreshed generically
-    _SPECIAL = {"employee_sk", "employee_number", "department_sk", "job_level", "job_role", "monthly_income",
+    _SPECIAL = {"employee_sk", "employee_number", "department_name", "job_level", "job_role", "monthly_income",
                 "start_date", "end_date", "is_current", "change_reason", "employee_name", "employee_email",
                 "synthetic_hire_date"}
     _INCOME_CANDIDATES = ("monthly_income", "monthlyincome")
@@ -198,13 +213,13 @@ class EmployeeSCD2Loader(BaseLoader):
     @staticmethod
     def _joins() -> str:
         return (f"JOIN {OLTP_SCHEMA}.departments od ON od.department_id = e.department_id "
-                f"JOIN {DW_SCHEMA}.dim_department dd ON dd.department_name = od.department_name "
                 f"JOIN {OLTP_SCHEMA}.job_roles jr ON jr.job_role_id = e.job_role_id")
 
     def _changed(self) -> str:
         income = self._context()["income"]
         cmp_income = f" AND de.monthly_income <=> e.`{income}`" if income else ""
-        return ("NOT (de.department_sk <=> dd.department_sk AND de.job_role <=> jr.job_title "
+        return (f"NOT (de.department_name <=> {ci('od.department_name')} "
+                f"AND de.job_role <=> {ci('jr.job_title')} "
                 f"AND de.job_level <=> e.job_level{cmp_income})")
 
     @staticmethod
@@ -244,7 +259,7 @@ class EmployeeSCD2Loader(BaseLoader):
         set_income = f", de.monthly_income = e.`{income}`" if income else ""
         report.updated += self.execute(
             f"UPDATE {DW_SCHEMA}.dim_employee de {src_join} "
-            f"SET de.department_sk = dd.department_sk, de.job_role = jr.job_title, de.job_level = e.job_level{set_income} "
+            f"SET de.department_name = od.department_name, de.job_role = jr.job_title, de.job_level = e.job_level{set_income} "
             f"WHERE de.is_current = 1 AND de.start_date >= :cd AND {changed} {flt}", params, conn)
 
         # (b) close the current version whose tracked attributes changed ----------------------
@@ -272,17 +287,17 @@ class EmployeeSCD2Loader(BaseLoader):
         income = ctx["income"]
         income_expr = f"e.`{income}`" if income else "old.monthly_income"
         reason_parts = [
-            "CASE WHEN NOT (old.department_sk <=> dd.department_sk) THEN 'Department change' END",
-            "CASE WHEN NOT (old.job_role <=> jr.job_title) THEN 'Job role change' END",
+            f"CASE WHEN NOT (old.department_name <=> {ci('od.department_name')}) THEN 'Department change' END",
+            f"CASE WHEN NOT (old.job_role <=> {ci('jr.job_title')}) THEN 'Job role change' END",
             "CASE WHEN NOT (old.job_level <=> e.job_level) THEN 'Job level change' END",
         ]
         if income:
             reason_parts.append(f"CASE WHEN NOT (old.monthly_income <=> e.`{income}`) THEN 'Salary change' END")
         reason = f"LEFT(CONCAT_WS(', ', {', '.join(reason_parts)}), 100)"
 
-        cols = ["employee_number", "department_sk", "job_level", "job_role", "monthly_income",
+        cols = ["employee_number", "department_name", "job_level", "job_role", "monthly_income",
                 "start_date", "end_date", "is_current", "change_reason"]
-        exprs = ["e.employee_number", "dd.department_sk", "e.job_level", "jr.job_title", income_expr,
+        exprs = ["e.employee_number", "od.department_name", "e.job_level", "jr.job_title", income_expr,
                  ":cd", f"'{HIGH_DATE}'", "1", reason]
         if ctx["has_name"]:
             cols.append("employee_name"); exprs.append("e.employee_name")
@@ -311,9 +326,9 @@ class EmployeeSCD2Loader(BaseLoader):
     def _insert_new_employees(self, conn: Connection, params: Dict[str, Any], flt: str) -> int:
         ctx = self._context()
         income = ctx["income"]
-        cols = ["employee_number", "department_sk", "job_level", "job_role", "start_date", "end_date",
+        cols = ["employee_number", "department_name", "job_level", "job_role", "start_date", "end_date",
                 "is_current", "change_reason"]
-        exprs = ["e.employee_number", "dd.department_sk", "e.job_level", "jr.job_title",
+        exprs = ["e.employee_number", "od.department_name", "e.job_level", "jr.job_title",
                  "COALESCE(e.hire_date, :cd)", f"'{HIGH_DATE}'", "1", "'New employee'"]
         if income:
             cols.append("monthly_income"); exprs.append(f"e.`{income}`")
@@ -343,8 +358,9 @@ class EmployeeSCD2Loader(BaseLoader):
         pairs += [(c, f"e.`{c}`") for c in ctx["common"]]
         if not pairs:
             return 0
+        is_text = lambda col: ctx["dim"].get(col, "") in TEXT_TYPES  # noqa: E731
         sets = ", ".join(f"de.`{c}` = {src}" for c, src in pairs)
-        same = " AND ".join(f"de.`{c}` <=> {src}" for c, src in pairs)
+        same = " AND ".join(f"de.`{c}` <=> {ci(src) if is_text(c) else src}" for c, src in pairs)
         p = {k: v for k, v in params.items() if k == "emp"}
         return self.execute(
             f"UPDATE {DW_SCHEMA}.dim_employee de "
@@ -370,7 +386,7 @@ class FactLoader(BaseLoader):
                 (source_review_id, employee_sk, project_sk, department_sk, review_date_sk,
                  performance_rating, job_satisfaction, review_score, review_count)
             WITH matched AS (
-                SELECT r.review_id, de.employee_sk, de.department_sk, dp.project_sk, dt.date_sk,
+                SELECT r.review_id, de.employee_sk, dd.department_sk, dp.project_sk, dt.date_sk,
                        r.performance_rating, r.job_satisfaction, r.review_score,
                        ROW_NUMBER() OVER (PARTITION BY r.review_id
                                           ORDER BY de.start_date DESC, de.employee_sk DESC) AS rn
@@ -378,6 +394,7 @@ class FactLoader(BaseLoader):
                 JOIN {OLTP_SCHEMA}.employees e ON e.employee_id = r.employee_id
                 JOIN {DW_SCHEMA}.dim_employee de ON de.employee_number = e.employee_number
                      AND r.review_date BETWEEN de.start_date AND de.end_date
+                JOIN {DW_SCHEMA}.dim_department dd ON dd.department_name = {ci('de.department_name')}
                 JOIN {DW_SCHEMA}.dim_project dp ON dp.project_id = r.project_id
                 JOIN {DW_SCHEMA}.dim_date dt ON dt.full_date = r.review_date
                 WHERE NOT EXISTS (SELECT 1 FROM {DW_SCHEMA}.fact_performance_reviews f
@@ -393,7 +410,7 @@ class FactLoader(BaseLoader):
             params, conn)
         report.skipped = int(left["n"]) if left else 0
         if report.skipped:
-            report.notes.append(f"{report.skipped} review(s) have no matching employee version / project / date")
+            report.notes.append(f"{report.skipped} review(s) have no matching employee version / department / project / date")
         return report
 
 
@@ -457,6 +474,17 @@ class ETLPipeline(DatabaseConnection):
             "oltp_employees_missing_in_dw": q(
                 f"SELECT COUNT(*) AS n FROM {OLTP_SCHEMA}.employees e WHERE NOT EXISTS "
                 f"(SELECT 1 FROM {dim} x WHERE x.employee_number = e.employee_number)"),
+            "employee_versions_with_unknown_department": q(
+                f"SELECT COUNT(*) AS n FROM {dim} de WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {DW_SCHEMA}.dim_department d WHERE d.department_name = {ci('de.department_name')})"),
+            "projects_with_unknown_department": q(
+                f"SELECT COUNT(*) AS n FROM {DW_SCHEMA}.dim_project p WHERE p.department_name IS NOT NULL AND NOT EXISTS "
+                f"(SELECT 1 FROM {DW_SCHEMA}.dim_department d WHERE d.department_name = {ci('p.department_name')})"),
+            "fact_department_differs_from_employee_version": q(
+                f"SELECT COUNT(*) AS n FROM {DW_SCHEMA}.fact_performance_reviews f "
+                f"JOIN {dim} de ON de.employee_sk = f.employee_sk "
+                f"JOIN {DW_SCHEMA}.dim_department d ON d.department_name = {ci('de.department_name')} "
+                "WHERE f.department_sk <> d.department_sk"),
             "reviews_missing_in_fact": q(
                 f"SELECT COUNT(*) AS n FROM {OLTP_SCHEMA}.performance_reviews r WHERE NOT EXISTS "
                 f"(SELECT 1 FROM {DW_SCHEMA}.fact_performance_reviews f WHERE f.source_review_id = r.review_id)"),
