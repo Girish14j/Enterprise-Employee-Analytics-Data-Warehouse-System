@@ -10,7 +10,7 @@ setup_page("Update employee", "🔄",
            "one (SCD Type 2), so history is kept.")
 svc = get_service()
 
-employee_id = employee_picker("Employee", key="upd")
+employee_id = employee_picker("Employee", key="upd", preview_rows=5)
 
 if employee_id:
     try:
