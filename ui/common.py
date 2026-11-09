@@ -128,13 +128,31 @@ def job_role_picker(label: str = "Job role", key: Optional[str] = None, containe
     return container.selectbox(label, ids, index=idx, format_func=lambda i: names[i], key=key)
 
 
-def employee_picker(label: str = "Employee", key: str = "emp") -> Optional[int]:
-    """Search box + result list. Returns the chosen ``employee_id`` (or None)."""
-    term = st.text_input(f"Search {label.lower()} by name or number", key=f"{key}_term")
-    if not term.strip():
+@st.cache_data(ttl=300, show_spinner=False)
+def employee_preview(rows: int) -> pd.DataFrame:
+    """First ``rows`` employees (by name) - shown under the search box before anything is typed."""
+    return get_service().employees.search(None, limit=rows)
+
+
+def employee_picker(label: str = "Employee", key: str = "emp", preview_rows: int = 0) -> Optional[int]:
+    """Search box + result list. Returns the chosen ``employee_id`` (or None).
+
+    With ``preview_rows`` > 0 a small table of employee details is shown right below the search box:
+    the first matches while searching, or the first employees when the box is empty.
+    """
+    term = st.text_input(f"Search {label.lower()} by name or number", key=f"{key}_term").strip()
+    df = get_service().employees.search(term, limit=50) if term else None
+
+    if preview_rows:
+        shown = df if df is not None else employee_preview(preview_rows)
+        if shown is not None and not shown.empty:
+            st.caption(f"First {min(preview_rows, len(shown))} matches" if term
+                       else f"First {min(preview_rows, len(shown))} employees - type above to search")
+            st.dataframe(shown.drop(columns=["employee_id"]).head(preview_rows), hide_index=True, width="stretch")
+
+    if df is None:
         st.caption("Type at least part of a name, or an exact employee number.")
         return None
-    df = get_service().employees.search(term, limit=50)
     if df.empty:
         st.warning("No employee matches that search.")
         return None
