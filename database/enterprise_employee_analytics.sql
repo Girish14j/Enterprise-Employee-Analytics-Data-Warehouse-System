@@ -642,135 +642,632 @@ CREATE TABLE IF NOT EXISTS fact_performance_reviews (
 
 
 -- =============================================================================
--- SECTION 4A: LOAD WAREHOUSE DIMENSIONS FROM OLTP / SCD2 STAGING
+-- SECTION 4A: ETL STORED PROCEDURE - OLTP / STAGING TO DATA WAREHOUSE
 --
--- Execute after Section 3A has populated OLTP and after CSVs are imported.
--- The SCD2 history source is loaded into Dim_Employee with its original
--- start_date, end_date, is_current and change_reason values.
+-- This procedure performs the warehouse ETL in dependency order:
+--   1. Load Dim_Department
+--   2. Load Dim_Project
+--   3. Load historical SCD Type 2 rows into Dim_Employee
+--   4. Load Dim_Date
+--   5. Load Fact_Performance_Reviews
 --
--- Each dimension is loaded independently. Department names are retained as
--- descriptive attributes in employee/project dimensions; there are no
--- dimension-to-dimension foreign keys. The fact table resolves department_sk
--- independently and references every dimension directly.
+-- CTEs (WITH clauses) clean, standardize, validate, and map source rows
+-- before inserting them into warehouse tables.
 --
--- Validate that each employee has exactly one current SCD2 row and that
--- historical intervals do not overlap before executing.
+-- It is designed to be rerunnable:
+--   * Dimension rows are matched by their business/unique keys.
+--   * Employee history rows are matched by employee_number + start_date.
+--   * Fact rows are matched by source_review_id.
+--
+-- The transaction makes the warehouse refresh atomic. If any statement
+-- fails, all changes made by this procedure are rolled back.
+--
+-- IMPORTANT:
+--   * Import CSVs and populate staging/OLTP before calling this procedure.
+--   * Validate SCD2 history (one current row per employee, no overlapping
+--     effective dates) before running the ETL.
+--   * This loads the SCD2 history already present in staging. It does not
+--     generate new SCD2 versions when an employee is changed in the OLTP app.
 -- =============================================================================
 
--- Load department dimension.
-INSERT INTO dim_department (department_name)
-SELECT DISTINCT department_name
-FROM hr_oltp.departments
-ON DUPLICATE KEY UPDATE department_name = VALUES(department_name);
+USE hr_dw;
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS sp_load_employee_analytics_dw$$
+
+CREATE PROCEDURE sp_load_employee_analytics_dw()
+BEGIN
+    DECLARE v_invalid_scd2_rows BIGINT DEFAULT 0;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    -- Preflight SCD2 validation using ROW_NUMBER().
+    -- The most recent version (highest start_date) must be the only
+    -- current version for each employee. Abort the ETL rather than loading
+    -- an inconsistent employee history.
+    WITH ranked_history_check AS (
+        SELECT
+            employee_number,
+            is_current,
+            ROW_NUMBER() OVER (
+                PARTITION BY employee_number
+                ORDER BY start_date DESC, end_date DESC
+            ) AS version_rank
+        FROM hr_staging.stg_employee_scd2_history
+        WHERE employee_number IS NOT NULL
+    )
+    SELECT COUNT(*)
+      INTO v_invalid_scd2_rows
+    FROM ranked_history_check
+    WHERE (version_rank = 1 AND is_current <> 1)
+       OR (version_rank > 1 AND is_current <> 0);
+
+    IF v_invalid_scd2_rows > 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'ETL stopped: staging employee history has invalid SCD2 current flags.';
+    END IF;
+
+    START TRANSACTION;
+
+    -- STEP 1: Load department dimension.
+    INSERT INTO dim_department (department_name)
+    WITH cleaned_departments AS (
+        SELECT DISTINCT TRIM(department_name) AS department_name
+        FROM hr_oltp.departments
+        WHERE department_name IS NOT NULL
+          AND TRIM(department_name) <> ''
+    )
+    SELECT department_name
+    FROM cleaned_departments
+    ON DUPLICATE KEY UPDATE
+        department_name = VALUES(department_name);
+
+    -- STEP 2: Load project dimension.
+    INSERT INTO dim_project (
+        project_id, project_name, department_name, start_date, end_date,
+        project_status, budget
+    )
+    WITH cleaned_projects AS (
+        SELECT
+            p.project_id,
+            TRIM(p.project_name) AS project_name,
+            TRIM(od.department_name) AS department_name,
+            p.start_date,
+            p.end_date,
+            TRIM(p.project_status) AS project_status,
+            p.budget
+        FROM hr_oltp.projects p
+        JOIN hr_oltp.departments od
+          ON od.department_id = p.department_id
+        WHERE p.project_name IS NOT NULL
+          AND TRIM(p.project_name) <> ''
+          AND od.department_name IS NOT NULL
+          AND TRIM(od.department_name) <> ''
+          AND (p.end_date IS NULL OR p.end_date >= p.start_date)
+          AND (p.budget IS NULL OR p.budget >= 0)
+    )
+    SELECT
+        project_id, project_name, department_name, start_date, end_date,
+        project_status, budget
+    FROM cleaned_projects
+    ON DUPLICATE KEY UPDATE
+        project_name = VALUES(project_name),
+        department_name = VALUES(department_name),
+        start_date = VALUES(start_date),
+        end_date = VALUES(end_date),
+        project_status = VALUES(project_status),
+        budget = VALUES(budget);
+
+    -- STEP 3: Load employee SCD Type 2 history from staging.
+    -- A version is identified by employee_number + start_date.
+    INSERT INTO dim_employee (
+        employee_number, employee_name, employee_email, age, attrition,
+        business_travel, daily_rate, department_name, distance_from_home,
+        education, education_field, gender, hourly_rate, job_involvement,
+        job_level, job_role, job_satisfaction, marital_status, monthly_income,
+        monthly_rate, num_companies_worked, overtime, percent_salary_hike,
+        performance_rating, relationship_satisfaction, stock_option_level,
+        total_working_years, training_times_last_year, work_life_balance,
+        years_at_company, years_in_current_role, years_since_last_promotion,
+        years_with_curr_manager, synthetic_hire_date, start_date, end_date,
+        is_current, change_reason
+    )
+    WITH cleaned_employee_history AS (
+        SELECT
+            h.*,
+            NULLIF(TRIM(h.synthetic_employee_name), '') AS clean_employee_name,
+            NULLIF(TRIM(h.synthetic_employee_email), '') AS clean_employee_email,
+            NULLIF(TRIM(h.department), '') AS clean_department
+        FROM hr_staging.stg_employee_scd2_history h
+        WHERE h.employee_number IS NOT NULL
+          AND h.start_date <= h.end_date
+          AND h.is_current IN (0, 1)
+    ),
+    ranked_employee_history AS (
+        SELECT
+            h.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY h.employee_number
+                ORDER BY h.start_date DESC, h.end_date DESC
+            ) AS version_rank
+        FROM cleaned_employee_history h
+    )
+    SELECT
+        h.employee_number,
+        COALESCE(h.clean_employee_name, CONCAT('Employee ', h.employee_number)),
+        h.clean_employee_email,
+        h.age,
+        h.attrition,
+        h.business_travel,
+        h.daily_rate,
+        h.clean_department,
+        h.distance_from_home,
+        h.education,
+        h.education_field,
+        h.gender,
+        h.hourly_rate,
+        h.job_involvement,
+        h.job_level,
+        h.job_role,
+        h.job_satisfaction,
+        h.marital_status,
+        h.monthly_income,
+        h.monthly_rate,
+        h.num_companies_worked,
+        h.overtime,
+        h.percent_salary_hike,
+        h.performance_rating,
+        h.relationship_satisfaction,
+        h.stock_option_level,
+        h.total_working_years,
+        h.training_times_last_year,
+        h.work_life_balance,
+        h.years_at_company,
+        h.years_in_current_role,
+        h.years_since_last_promotion,
+        h.years_with_curr_manager,
+        h.synthetic_hire_date,
+        h.start_date,
+        h.end_date,
+        h.is_current,
+        h.change_reason
+    FROM ranked_employee_history h
+    WHERE h.clean_department IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1
+          FROM dim_employee existing
+          WHERE existing.employee_number = h.employee_number
+            AND existing.start_date = h.start_date
+      )
+    ORDER BY h.employee_number, h.version_rank;
+
+    -- STEP 4: Load date dimension from OLTP review dates.
+    INSERT INTO dim_date (
+        date_sk, full_date, day_number, month_number, month_name,
+        quarter_number, year_number, weekday_name
+    )
+    WITH distinct_review_dates AS (
+        SELECT DISTINCT review_date
+        FROM hr_oltp.performance_reviews
+        WHERE review_date IS NOT NULL
+    )
+    SELECT
+        CAST(DATE_FORMAT(review_date, '%Y%m%d') AS UNSIGNED),
+        review_date,
+        DAY(review_date),
+        MONTH(review_date),
+        MONTHNAME(review_date),
+        QUARTER(review_date),
+        YEAR(review_date),
+        DAYNAME(review_date)
+    FROM distinct_review_dates
+    ON DUPLICATE KEY UPDATE
+        full_date = VALUES(full_date);
+
+    -- STEP 5: Load the fact table.
+    -- Resolve the employee's historical dimension version valid on review_date.
+    INSERT INTO fact_performance_reviews (
+        source_review_id, employee_sk, project_sk, department_sk,
+        review_date_sk, performance_rating, job_satisfaction, review_score,
+        review_count
+    )
+    WITH resolved_review_source AS (
+        SELECT
+            r.review_id,
+            r.review_date,
+            r.performance_rating,
+            r.job_satisfaction,
+            r.review_score,
+            oe.employee_number,
+            r.project_id
+        FROM hr_oltp.performance_reviews r
+        JOIN hr_oltp.employees oe
+          ON oe.employee_id = r.employee_id
+        WHERE r.review_date IS NOT NULL
+    ),
+    mapped_reviews AS (
+        SELECT
+            r.review_id,
+            de.employee_sk,
+            dp.project_sk,
+            dd.department_sk,
+            CAST(DATE_FORMAT(r.review_date, '%Y%m%d') AS UNSIGNED) AS review_date_sk,
+            r.performance_rating,
+            r.job_satisfaction,
+            r.review_score
+        FROM resolved_review_source r
+        JOIN dim_employee de
+          ON de.employee_number = r.employee_number
+         AND r.review_date >= de.start_date
+         AND r.review_date <= de.end_date
+        JOIN dim_project dp
+          ON dp.project_id = r.project_id
+        JOIN dim_department dd
+          ON dd.department_name = de.department_name
+    )
+    SELECT
+        review_id,
+        employee_sk,
+        project_sk,
+        department_sk,
+        review_date_sk,
+        performance_rating,
+        job_satisfaction,
+        review_score,
+        1
+    FROM mapped_reviews
+    ON DUPLICATE KEY UPDATE
+        employee_sk = VALUES(employee_sk),
+        project_sk = VALUES(project_sk),
+        department_sk = VALUES(department_sk),
+        review_date_sk = VALUES(review_date_sk),
+        performance_rating = VALUES(performance_rating),
+        job_satisfaction = VALUES(job_satisfaction),
+        review_score = VALUES(review_score),
+        review_count = VALUES(review_count);
+
+    COMMIT;
+
+    -- Return a compact ETL completion summary.
+    SELECT 'dim_department' AS table_name, COUNT(*) AS warehouse_rows
+    FROM dim_department
+    UNION ALL
+    SELECT 'dim_project', COUNT(*) FROM dim_project
+    UNION ALL
+    SELECT 'dim_employee', COUNT(*) FROM dim_employee
+    UNION ALL
+    SELECT 'dim_date', COUNT(*) FROM dim_date
+    UNION ALL
+    SELECT 'fact_performance_reviews', COUNT(*) FROM fact_performance_reviews;
+END$$
+
+DELIMITER ;
+
+-- Execute the warehouse ETL after staging and OLTP loads are complete.
+CALL sp_load_employee_analytics_dw();
 
 
--- Load project dimension.
-INSERT INTO dim_project (
-    project_id, project_name, department_name, start_date, end_date,
-    project_status, budget
+-- =============================================================================
+-- SECTION 4B: AUTOMATIC SCD TYPE 2 CHANGE CAPTURE FROM OLTP EMPLOYEES
+--
+-- Call this procedure after an employee is inserted/updated in hr_oltp.
+-- It compares the current OLTP employee snapshot with the current
+-- Dim_Employee version. If tracked attributes changed:
+--   1. Expire the old dimension version (end_date = effective_date - 1 day).
+--   2. Insert a new current version with a new employee_sk.
+--
+-- New OLTP employees are inserted as their first dimension version.
+-- Unchanged employees are not inserted again.
+--
+-- p_effective_date is supplied by the caller so the business-effective date
+-- is explicit and repeatable. It must be later than the current version's
+-- start_date for any changed employee.
+--
+-- This procedure tracks the attributes represented in Dim_Employee.
+-- OLTP-only fields such as manager_id and employment_status are not tracked
+-- because corresponding columns do not exist in the current Dim_Employee.
+--
+-- NOTE: The first historical load should be completed before using this
+-- procedure for ongoing changes. Do not call it concurrently with the main
+-- warehouse ETL procedure.
+-- =============================================================================
+
+USE hr_dw;
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS sp_apply_employee_scd2_changes$$
+
+CREATE PROCEDURE sp_apply_employee_scd2_changes(
+    IN p_effective_date DATE
 )
-SELECT
-    p.project_id, p.project_name, od.department_name, p.start_date, p.end_date,
-    p.project_status, p.budget
-FROM hr_oltp.projects p
-JOIN hr_oltp.departments od ON od.department_id = p.department_id
-ON DUPLICATE KEY UPDATE
-    project_name = VALUES(project_name),
-    department_name = VALUES(department_name),
-    start_date = VALUES(start_date),
-    end_date = VALUES(end_date),
-    project_status = VALUES(project_status),
-    budget = VALUES(budget);
+BEGIN
+    DECLARE v_changed_count INT DEFAULT 0;
 
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        DROP TEMPORARY TABLE IF EXISTS tmp_employee_scd2_snapshot;
+        RESIGNAL;
+    END;
 
--- Load employee SCD2 versions from history staging.
--- This is an initial historical load. Do not truncate Dim_Employee in routine
--- refreshes. The NOT EXISTS check prevents duplicate versions with the same
--- employee key and validity start date.
-INSERT INTO dim_employee (
-    employee_number, employee_name, employee_email, age, attrition,
-    business_travel, daily_rate, department_name, distance_from_home,
-    education, education_field, gender, hourly_rate, job_involvement,
-    job_level, job_role, job_satisfaction, marital_status, monthly_income,
-    monthly_rate, num_companies_worked, overtime, percent_salary_hike,
-    performance_rating, relationship_satisfaction, stock_option_level,
-    total_working_years, training_times_last_year, work_life_balance,
-    years_at_company, years_in_current_role, years_since_last_promotion,
-    years_with_curr_manager, synthetic_hire_date, start_date, end_date,
-    is_current, change_reason
-)
-SELECT
-    h.employee_number, h.synthetic_employee_name, h.synthetic_employee_email,
-    h.age, h.attrition, h.business_travel, h.daily_rate, TRIM(h.department),
-    h.distance_from_home, h.education, h.education_field, h.gender,
-    h.hourly_rate, h.job_involvement, h.job_level, h.job_role,
-    h.job_satisfaction, h.marital_status, h.monthly_income, h.monthly_rate,
-    h.num_companies_worked, h.overtime, h.percent_salary_hike,
-    h.performance_rating, h.relationship_satisfaction, h.stock_option_level,
-    h.total_working_years, h.training_times_last_year, h.work_life_balance,
-    h.years_at_company, h.years_in_current_role, h.years_since_last_promotion,
-    h.years_with_curr_manager, h.synthetic_hire_date, h.start_date, h.end_date,
-    h.is_current, h.change_reason
-FROM hr_staging.stg_employee_scd2_history h
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM dim_employee existing
-    WHERE existing.employee_number = h.employee_number
-      AND existing.start_date = h.start_date
-);
+    IF p_effective_date IS NULL THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Effective date cannot be NULL.';
+    END IF;
 
+    START TRANSACTION;
 
--- Populate date dimension from the distinct review dates.
-INSERT INTO dim_date (
-    date_sk, full_date, day_number, month_number, month_name,
-    quarter_number, year_number, weekday_name
-)
-SELECT DISTINCT
-    CAST(DATE_FORMAT(r.review_date, '%Y%m%d') AS UNSIGNED),
-    r.review_date,
-    DAY(r.review_date),
-    MONTH(r.review_date),
-    MONTHNAME(r.review_date),
-    QUARTER(r.review_date),
-    YEAR(r.review_date),
-    DAYNAME(r.review_date)
-FROM hr_oltp.performance_reviews r
-ON DUPLICATE KEY UPDATE full_date = VALUES(full_date);
+    DROP TEMPORARY TABLE IF EXISTS tmp_employee_scd2_snapshot;
 
+    -- Define the temporary snapshot explicitly with a primary key.
+    -- Aiven has sql_require_primary_key enabled, so CREATE TABLE ... AS
+    -- SELECT without a primary key is rejected.
+    CREATE TEMPORARY TABLE tmp_employee_scd2_snapshot (
+        employee_number INT NOT NULL PRIMARY KEY,
+        employee_name VARCHAR(150),
+        employee_email VARCHAR(255),
+        age TINYINT UNSIGNED,
+        attrition VARCHAR(5),
+        business_travel VARCHAR(30),
+        daily_rate SMALLINT UNSIGNED,
+        department_name VARCHAR(100),
+        distance_from_home TINYINT UNSIGNED,
+        education TINYINT UNSIGNED,
+        education_field VARCHAR(100),
+        gender VARCHAR(20),
+        hourly_rate TINYINT UNSIGNED,
+        job_involvement TINYINT UNSIGNED,
+        job_level TINYINT UNSIGNED,
+        job_role VARCHAR(100),
+        job_satisfaction TINYINT UNSIGNED,
+        marital_status VARCHAR(30),
+        monthly_income DECIMAL(12,2),
+        monthly_rate INT UNSIGNED,
+        num_companies_worked TINYINT UNSIGNED,
+        overtime VARCHAR(5),
+        percent_salary_hike TINYINT UNSIGNED,
+        performance_rating TINYINT UNSIGNED,
+        relationship_satisfaction TINYINT UNSIGNED,
+        stock_option_level TINYINT UNSIGNED,
+        total_working_years TINYINT UNSIGNED,
+        training_times_last_year TINYINT UNSIGNED,
+        work_life_balance TINYINT UNSIGNED,
+        years_at_company TINYINT UNSIGNED,
+        years_in_current_role TINYINT UNSIGNED,
+        years_since_last_promotion TINYINT UNSIGNED,
+        years_with_curr_manager TINYINT UNSIGNED,
+        synthetic_hire_date DATE,
+        attribute_hash CHAR(64)
+    ) ENGINE=InnoDB;
 
--- Load performance review facts.
--- Employee dimension row is selected using the review date's SCD2 validity.
-INSERT INTO fact_performance_reviews (
-    source_review_id, employee_sk, project_sk, department_sk,
-    review_date_sk, performance_rating, job_satisfaction, review_score,
-    review_count
-)
-SELECT
-    r.review_id,
-    de.employee_sk,
-    dp.project_sk,
-    dd.department_sk,
-    CAST(DATE_FORMAT(r.review_date, '%Y%m%d') AS UNSIGNED),
-    r.performance_rating,
-    r.job_satisfaction,
-    r.review_score,
-    1
-FROM hr_oltp.performance_reviews r
-JOIN hr_oltp.employees oe ON oe.employee_id = r.employee_id
-JOIN dim_employee de
-  ON de.employee_number = oe.employee_number
- AND r.review_date >= de.start_date
- AND r.review_date <= de.end_date
-JOIN dim_project dp ON dp.project_id = r.project_id
-JOIN dim_department dd ON dd.department_name = de.department_name
-ON DUPLICATE KEY UPDATE
-    employee_sk = VALUES(employee_sk),
-    project_sk = VALUES(project_sk),
-    department_sk = VALUES(department_sk),
-    review_date_sk = VALUES(review_date_sk),
-    performance_rating = VALUES(performance_rating),
-    job_satisfaction = VALUES(job_satisfaction),
-    review_score = VALUES(review_score);
+    INSERT INTO tmp_employee_scd2_snapshot (
+        employee_number, employee_name, employee_email, age, attrition,
+        business_travel, daily_rate, department_name, distance_from_home,
+        education, education_field, gender, hourly_rate, job_involvement,
+        job_level, job_role, job_satisfaction, marital_status, monthly_income,
+        monthly_rate, num_companies_worked, overtime, percent_salary_hike,
+        performance_rating, relationship_satisfaction, stock_option_level,
+        total_working_years, training_times_last_year, work_life_balance,
+        years_at_company, years_in_current_role, years_since_last_promotion,
+        years_with_curr_manager, synthetic_hire_date, attribute_hash
+    )
+    SELECT
+        e.employee_number,
+        e.employee_name,
+        e.email,
+        e.age,
+        e.attrition,
+        e.business_travel,
+        e.daily_rate,
+        d.department_name,
+        e.distance_from_home,
+        e.education,
+        e.education_field,
+        e.gender,
+        e.hourly_rate,
+        e.job_involvement,
+        e.job_level,
+        j.job_title,
+        e.job_satisfaction,
+        e.marital_status,
+        e.monthly_income,
+        e.monthly_rate,
+        e.num_companies_worked,
+        e.overtime,
+        e.percent_salary_hike,
+        e.performance_rating,
+        e.relationship_satisfaction,
+        e.stock_option_level,
+        e.total_working_years,
+        e.training_times_last_year,
+        e.work_life_balance,
+        e.years_at_company,
+        e.years_in_current_role,
+        e.years_since_last_promotion,
+        e.years_with_curr_manager,
+        e.hire_date,
+        SHA2(
+            CAST(JSON_ARRAY(
+                e.employee_name, e.email, e.age, e.attrition,
+                e.business_travel, e.daily_rate, d.department_name,
+                e.distance_from_home, e.education, e.education_field,
+                e.gender, e.hourly_rate, e.job_involvement, e.job_level,
+                j.job_title, e.job_satisfaction, e.marital_status,
+                e.monthly_income, e.monthly_rate, e.num_companies_worked,
+                e.overtime, e.percent_salary_hike, e.performance_rating,
+                e.relationship_satisfaction, e.stock_option_level,
+                e.total_working_years, e.training_times_last_year,
+                e.work_life_balance, e.years_at_company,
+                e.years_in_current_role, e.years_since_last_promotion,
+                e.years_with_curr_manager, e.hire_date
+            ) AS CHAR),
+            256
+        )
+    FROM hr_oltp.employees e
+    JOIN hr_oltp.departments d
+      ON d.department_id = e.department_id
+    JOIN hr_oltp.job_roles j
+      ON j.job_role_id = e.job_role_id;
+
+    -- Reject a backdated or same-day change that would create an invalid
+    -- zero-length/overlapping SCD2 interval.
+    SELECT COUNT(*)
+      INTO v_changed_count
+    FROM tmp_employee_scd2_snapshot s
+    JOIN dim_employee de
+      ON de.employee_number = s.employee_number
+     AND de.is_current = TRUE
+    WHERE de.start_date >= p_effective_date
+      AND de.employee_name IS NOT NULL
+      AND SHA2(
+            CAST(JSON_ARRAY(
+                de.employee_name, de.employee_email, de.age, de.attrition,
+                de.business_travel, de.daily_rate, de.department_name,
+                de.distance_from_home, de.education, de.education_field,
+                de.gender, de.hourly_rate, de.job_involvement, de.job_level,
+                de.job_role, de.job_satisfaction, de.marital_status,
+                de.monthly_income, de.monthly_rate, de.num_companies_worked,
+                de.overtime, de.percent_salary_hike, de.performance_rating,
+                de.relationship_satisfaction, de.stock_option_level,
+                de.total_working_years, de.training_times_last_year,
+                de.work_life_balance, de.years_at_company,
+                de.years_in_current_role, de.years_since_last_promotion,
+                de.years_with_curr_manager, de.synthetic_hire_date
+            ) AS CHAR),
+            256
+          ) <> s.attribute_hash;
+
+    IF v_changed_count > 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Effective date must be later than the current SCD2 start_date for changed employees.';
+    END IF;
+
+    -- Expire only current versions whose tracked attributes have changed.
+    UPDATE dim_employee de
+    JOIN tmp_employee_scd2_snapshot s
+      ON s.employee_number = de.employee_number
+    SET
+        de.end_date = DATE_SUB(p_effective_date, INTERVAL 1 DAY),
+        de.is_current = FALSE,
+        de.change_reason = 'Tracked employee attribute changed'
+    WHERE de.is_current = TRUE
+      AND SHA2(
+            CAST(JSON_ARRAY(
+                de.employee_name, de.employee_email, de.age, de.attrition,
+                de.business_travel, de.daily_rate, de.department_name,
+                de.distance_from_home, de.education, de.education_field,
+                de.gender, de.hourly_rate, de.job_involvement, de.job_level,
+                de.job_role, de.job_satisfaction, de.marital_status,
+                de.monthly_income, de.monthly_rate, de.num_companies_worked,
+                de.overtime, de.percent_salary_hike, de.performance_rating,
+                de.relationship_satisfaction, de.stock_option_level,
+                de.total_working_years, de.training_times_last_year,
+                de.work_life_balance, de.years_at_company,
+                de.years_in_current_role, de.years_since_last_promotion,
+                de.years_with_curr_manager, de.synthetic_hire_date
+            ) AS CHAR),
+            256
+          ) <> s.attribute_hash;
+
+    -- Insert a new version for changed employees and first versions for
+    -- employees that do not yet exist in Dim_Employee.
+    INSERT INTO dim_employee (
+        employee_number, employee_name, employee_email, age, attrition,
+        business_travel, daily_rate, department_name, distance_from_home,
+        education, education_field, gender, hourly_rate, job_involvement,
+        job_level, job_role, job_satisfaction, marital_status, monthly_income,
+        monthly_rate, num_companies_worked, overtime, percent_salary_hike,
+        performance_rating, relationship_satisfaction, stock_option_level,
+        total_working_years, training_times_last_year, work_life_balance,
+        years_at_company, years_in_current_role, years_since_last_promotion,
+        years_with_curr_manager, synthetic_hire_date, start_date, end_date,
+        is_current, change_reason
+    )
+    SELECT
+        s.employee_number,
+        s.employee_name,
+        s.employee_email,
+        s.age,
+        s.attrition,
+        s.business_travel,
+        s.daily_rate,
+        s.department_name,
+        s.distance_from_home,
+        s.education,
+        s.education_field,
+        s.gender,
+        s.hourly_rate,
+        s.job_involvement,
+        s.job_level,
+        s.job_role,
+        s.job_satisfaction,
+        s.marital_status,
+        s.monthly_income,
+        s.monthly_rate,
+        s.num_companies_worked,
+        s.overtime,
+        s.percent_salary_hike,
+        s.performance_rating,
+        s.relationship_satisfaction,
+        s.stock_option_level,
+        s.total_working_years,
+        s.training_times_last_year,
+        s.work_life_balance,
+        s.years_at_company,
+        s.years_in_current_role,
+        s.years_since_last_promotion,
+        s.years_with_curr_manager,
+        s.synthetic_hire_date,
+        p_effective_date,
+        '2099-12-31',
+        TRUE,
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM dim_employee old_de
+                WHERE old_de.employee_number = s.employee_number
+                  AND old_de.is_current = FALSE
+                  AND old_de.end_date = DATE_SUB(p_effective_date, INTERVAL 1 DAY)
+            )
+            THEN 'Tracked employee attribute changed'
+            ELSE 'Initial OLTP employee load'
+        END
+    FROM tmp_employee_scd2_snapshot s
+    LEFT JOIN dim_employee current_de
+      ON current_de.employee_number = s.employee_number
+     AND current_de.is_current = TRUE
+    WHERE current_de.employee_sk IS NULL;
+
+    DROP TEMPORARY TABLE IF EXISTS tmp_employee_scd2_snapshot;
+
+    COMMIT;
+
+    SELECT
+        'SCD Type 2 synchronization completed' AS status,
+        p_effective_date AS effective_date,
+        (SELECT COUNT(*)
+         FROM dim_employee
+         WHERE is_current = TRUE) AS current_employee_versions;
+END$$
+
+DELIMITER ;
+
+-- Example usage (run manually AFTER updating an employee in hr_oltp):
+-- CALL hr_dw.sp_apply_employee_scd2_changes(CURDATE());
+--
+-- Verify an employee's history (replace 1001 with a real employee_number):
+-- SELECT employee_number, employee_name, department_name, monthly_income,
+--        start_date, end_date, is_current, change_reason
+-- FROM hr_dw.dim_employee
+-- WHERE employee_number = 1001
+-- ORDER BY start_date;
 
 
 -- =============================================================================
