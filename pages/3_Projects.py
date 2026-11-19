@@ -7,7 +7,8 @@ from src.models.entities import Project
 from ui.common import (department_picker, employee_picker, get_service, project_status_options, refresh_data,
                        setup_page, show_error, show_result)
 
-setup_page("Projects", "📁", "Create projects, then staff them. New projects are copied to the warehouse automatically.")
+setup_page("Projects", "📁", "Create projects, then staff them. New projects are copied to the warehouse automatically.",
+           allowed_roles=("HR",))
 svc = get_service()
 
 tab_create, tab_assign, tab_list = st.tabs(["Create project", "Assign employees", "All projects"])

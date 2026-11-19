@@ -60,7 +60,40 @@ def _database_status() -> Tuple[bool, str]:
         return False, str(exc)
 
 
-def setup_page(title: str, icon: str, subtitle: str = "", require_db: bool = True) -> None:
+def _require_authenticated_user() -> Dict[str, Any]:
+    user = st.session_state.get("auth_user")
+    if user:
+        try:
+            current_user = get_service().auth.get_session_user(int(user["account_id"]))
+        except AppError as exc:
+            show_error(exc)
+            st.stop()
+        if current_user:
+            st.session_state["auth_user"] = current_user
+            return current_user
+        st.session_state.pop("auth_user", None)
+        st.warning("Your account is inactive or its job role is no longer authorized. Please sign in again.")
+
+    st.subheader("Sign in")
+    with st.form("login_form"):
+        username = st.text_input("Work email")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in", type="primary")
+    if submitted:
+        try:
+            authenticated_user = get_service().auth.authenticate(username, password)
+        except AppError as exc:
+            show_error(exc)
+            st.stop()
+        if authenticated_user:
+            st.session_state["auth_user"] = authenticated_user
+            st.rerun()
+        st.error("Invalid email or password, or this account is not permitted to use the application.")
+    st.stop()
+
+
+def setup_page(title: str, icon: str, subtitle: str = "", require_db: bool = True,
+               allowed_roles: Optional[Sequence[str]] = None) -> None:
     st.set_page_config(page_title=f"{title} - HR Analytics", page_icon=icon, layout="wide")
     _load_secrets_into_env()
     st.markdown(_CSS, unsafe_allow_html=True)
@@ -75,6 +108,16 @@ def setup_page(title: str, icon: str, subtitle: str = "", require_db: bool = Tru
         st.error(f"Cannot reach the database: {detail}")
         st.info("Check `.env` (local) or Secrets (Streamlit Cloud): DB_HOST, DB_PORT, DB_USER, DB_PASSWORD "
                 "and DB_SSL_CA / DB_SSL_CA_PEM.")
+        st.stop()
+    user = _require_authenticated_user()
+    with st.sidebar:
+        st.markdown(f"**{user['employee_name']}**")
+        st.caption(user["role"])
+        if st.button("Log out", key="logout"):
+            st.session_state.pop("auth_user", None)
+            st.rerun()
+    if allowed_roles and user["role"] not in allowed_roles:
+        st.error("You do not have permission to access this page.")
         st.stop()
 
 

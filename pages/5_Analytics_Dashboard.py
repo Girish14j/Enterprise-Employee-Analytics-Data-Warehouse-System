@@ -4,7 +4,8 @@ import streamlit as st
 from ui.common import PALETTE, RISK_COLORS, get_service, setup_page, show_error, style_fig
 
 setup_page("Analytics dashboard", "📊",
-           "Reads only from the data warehouse (star schema). Figures update after each ETL sync.")
+           "Reads only from the data warehouse (star schema). Figures update after each ETL sync.",
+           allowed_roles=("HR", "Executive"))
 analytics = get_service().analytics
 
 FLAG_COLORS = {"Overdue": RISK_COLORS["High"], "Low performance": RISK_COLORS["Medium"],

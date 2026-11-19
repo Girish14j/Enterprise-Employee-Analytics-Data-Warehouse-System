@@ -7,7 +7,7 @@ from ui.common import get_service, history_timeline, refresh_data, setup_page, s
 
 setup_page("Warehouse sync", "🔁",
            "Forms already sync after every save. Use this page to check data quality, retry a failed sync, "
-           "or inspect an employee's history.")
+           "or inspect an employee's history.", allowed_roles=("HR",))
 svc = get_service()
 
 tab_sync, tab_quality, tab_history = st.tabs(["Sync", "Data quality", "Employee history"])

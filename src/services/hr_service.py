@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.etl.pipeline import ETLPipeline, SyncReport
 from src.exceptions import AppError
 from src.managers.analytics_manager import AnalyticsManager
+from src.managers.auth_manager import AuthManager
 from src.managers.employee_manager import EmployeeManager
 from src.managers.project_manager import ProjectManager
 from src.managers.review_manager import ReviewManager
@@ -47,6 +48,7 @@ class ActionResult:
 
 class HRService:
     def __init__(self) -> None:
+        self.auth = AuthManager()
         self.employees = EmployeeManager()
         self.projects = ProjectManager()
         self.reviews = ReviewManager()

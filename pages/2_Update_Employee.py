@@ -7,7 +7,7 @@ from ui.common import (department_picker, employee_picker, get_service, history_
 
 setup_page("Update employee", "🔄",
            "A change to department, job role, level or salary closes the old warehouse record and opens a new "
-           "one (SCD Type 2), so history is kept.")
+           "one (SCD Type 2), so history is kept.", allowed_roles=("HR",))
 svc = get_service()
 
 employee_id = employee_picker("Employee", key="upd", preview_rows=5)

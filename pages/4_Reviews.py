@@ -8,7 +8,7 @@ from ui.common import employee_picker, get_service, refresh_data, setup_page, sh
 
 setup_page("Performance reviews", "📝",
            "Each saved review becomes a row in the warehouse fact table, linked to the employee's record "
-           "as it was on the review date.")
+           "as it was on the review date.", allowed_roles=("HR",))
 svc = get_service()
 
 employee_id = employee_picker("Employee", key="rev")
