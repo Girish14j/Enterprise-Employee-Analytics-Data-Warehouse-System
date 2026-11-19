@@ -25,8 +25,8 @@ class Employee(Entity):
 
     employee_id = Field(v.int_range(1, 2**63 - 1))
     employee_number = Field(v.int_range(1, 999_999_999), required=True)
-    first_name = Field(v.text(100), required=True)
-    last_name = Field(v.text(100), required=True)
+    first_name = Field(v.person_name(100), required=True)
+    last_name = Field(v.person_name(100), required=True)
     email = Field(v.email(), required=True)
     department_id = Field(v.int_range(1, 2**31 - 1), required=True)
     job_role_id = Field(v.int_range(1, 2**31 - 1), required=True)

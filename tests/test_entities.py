@@ -79,3 +79,16 @@ def test_review_rules():
             Review(employee_id=1, project_id=1, review_date=date(2024, 5, 1), **bad)
     with pytest.raises(ValidationError):
         Review(employee_id=1, project_id=1, review_date=date(2024, 5, 1)).validate()
+
+
+@pytest.mark.parametrize("name", ["Asha", "Mary-Anne", "O'Brien", "Anna Maria", "José", "Łukasz", "  Asha   Rao  "])
+def test_valid_names_are_accepted_and_cleaned(name):
+    e = make_employee(first_name=name, last_name=name)
+    assert e.first_name == " ".join(name.split())
+
+
+@pytest.mark.parametrize("name", ["Asha1", "123", "R2D2", "Asha_Rao", "Asha!", "-Asha", "Asha-", "Asha--Rao", "A.B"])
+@pytest.mark.parametrize("field", ["first_name", "last_name"])
+def test_names_with_numbers_or_symbols_are_rejected(field, name):
+    with pytest.raises(ValidationError):
+        make_employee(**{field: name})
