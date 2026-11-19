@@ -21,6 +21,23 @@ def text(max_len: int, min_len: int = 1) -> Validator:
     return _v
 
 
+# Letters from any alphabet, optionally separated by a single space, hyphen or apostrophe
+# (Mary-Anne, O'Brien, Anna Maria). Digits, underscores and other symbols are rejected.
+NAME_RE = re.compile(r"^[^\W\d_]+(?:[ '\-][^\W\d_]+)*$")
+
+
+def person_name(max_len: int = 100) -> Validator:
+    def _v(value: Any, label: str) -> str:
+        s = " ".join(str(value).split())  # trim and collapse repeated spaces
+        if len(s) > max_len:
+            raise ValidationError(f"{label} must be at most {max_len} characters long.")
+        if not NAME_RE.match(s):
+            raise ValidationError(f"{label} can contain only letters (spaces, hyphens and apostrophes between "
+                                  "letters are allowed). Numbers and other symbols are not allowed.")
+        return s
+    return _v
+
+
 def email(max_len: int = 255) -> Validator:
     def _v(value: Any, label: str) -> str:
         s = str(value).strip().lower()
