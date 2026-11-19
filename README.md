@@ -439,8 +439,9 @@ The app requires an account linked to an active employee. Passwords are stored a
 | Human Resources | HR: all pages and actions |
 | Sales Executive | Executive: analytics dashboard only |
 
-Other job roles are not permitted. Page permissions are checked before a page loads its data, and the account
-and employee status plus current job role are revalidated on each page run. Accounts are provisioned by an
+Other job roles are not permitted. Logged-out users see only the sign-in page; the Executive sidebar lists
+only the analytics dashboard. Page permissions are checked before a page loads its data, and the account and
+employee status plus current job title are revalidated on each page run. Accounts are provisioned by an
 operator, not through public registration.
 
 For an existing database, apply `database/user_accounts_migration.sql` to `hr_oltp` before starting the app.

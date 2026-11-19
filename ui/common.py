@@ -60,41 +60,29 @@ def _database_status() -> Tuple[bool, str]:
         return False, str(exc)
 
 
-def _require_authenticated_user() -> Dict[str, Any]:
+def _require_authenticated_user() -> Optional[Dict[str, Any]]:
     user = st.session_state.get("auth_user")
-    if user:
-        try:
-            current_user = get_service().auth.get_session_user(int(user["account_id"]))
-        except AppError as exc:
-            show_error(exc)
-            st.stop()
-        if current_user:
-            st.session_state["auth_user"] = current_user
-            return current_user
-        st.session_state.pop("auth_user", None)
-        st.warning("Your account is inactive or its job role is no longer authorized. Please sign in again.")
-
-    st.subheader("Sign in")
-    with st.form("login_form"):
-        username = st.text_input("Work email")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Log in", type="primary")
-    if submitted:
-        try:
-            authenticated_user = get_service().auth.authenticate(username, password)
-        except AppError as exc:
-            show_error(exc)
-            st.stop()
-        if authenticated_user:
-            st.session_state["auth_user"] = authenticated_user
+    if not isinstance(user, dict):
+        return None
+    try:
+        current_user = get_service().auth.get_session_user(int(user["account_id"]))
+    except AppError as exc:
+        show_error(exc)
+        st.stop()
+    if current_user:
+        role_changed = current_user["role"] != user.get("role")
+        st.session_state["auth_user"] = current_user
+        if role_changed:
             st.rerun()
-        st.error("Invalid email or password, or this account is not permitted to use the application.")
-    st.stop()
+        return current_user
+    st.session_state.pop("auth_user", None)
+    st.session_state["auth_notice"] = (
+        "Your account is inactive or its job role is no longer authorized. Please sign in again."
+    )
+    st.rerun()
 
 
-def setup_page(title: str, icon: str, subtitle: str = "", require_db: bool = True,
-               allowed_roles: Optional[Sequence[str]] = None) -> None:
-    st.set_page_config(page_title=f"{title} - HR Analytics", page_icon=icon, layout="wide")
+def _setup_page_frame(title: str, icon: str, subtitle: str, require_db: bool) -> None:
     _load_secrets_into_env()
     st.markdown(_CSS, unsafe_allow_html=True)
     st.title(f"{icon} {title}")
@@ -109,8 +97,44 @@ def setup_page(title: str, icon: str, subtitle: str = "", require_db: bool = Tru
         st.info("Check `.env` (local) or Secrets (Streamlit Cloud): DB_HOST, DB_PORT, DB_USER, DB_PASSWORD "
                 "and DB_SSL_CA / DB_SSL_CA_PEM.")
         st.stop()
+
+
+def setup_login_page() -> None:
+    """Render the dedicated sign-in page."""
+    _setup_page_frame("Sign in", "🔐", "Sign in with your employee work email and password.", True)
     user = _require_authenticated_user()
+    if user:
+        st.info("You are already signed in.")
+        st.stop()
+    notice = st.session_state.pop("auth_notice", None)
+    if notice:
+        st.warning(notice)
+    with st.form("login_form"):
+        username = st.text_input("Work email")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in", type="primary")
+    if submitted:
+        try:
+            authenticated_user = get_service().auth.authenticate(username, password)
+        except AppError as exc:
+            show_error(exc)
+            st.stop()
+        if authenticated_user:
+            st.session_state["auth_user"] = authenticated_user
+            st.rerun()
+        st.error("Invalid email or password, or this account is not permitted to use the application.")
+
+
+def setup_page(title: str, icon: str, subtitle: str = "", require_db: bool = True,
+               allowed_roles: Optional[Sequence[str]] = None) -> None:
+    _setup_page_frame(title, icon, subtitle, require_db)
+    user = _require_authenticated_user()
+    if not user:
+        st.error("Please sign in to access this page.")
+        st.stop()
     with st.sidebar:
+        if user["role"] == "Executive":
+            st.page_link("pages/5_Analytics_Dashboard.py", label="Analytics dashboard", icon="📊")
         st.markdown(f"**{user['employee_name']}**")
         st.caption(user["role"])
         if st.button("Log out", key="logout"):
