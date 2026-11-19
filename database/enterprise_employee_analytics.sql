@@ -1,34 +1,4 @@
--- =============================================================================
--- ENTERPRISE EMPLOYEE ANALYTICS & DATA WAREHOUSE SYSTEM
--- Master SQL file | MySQL 8.0+
---
--- Databases:
---   1. hr_staging : imported CSV data
---   2. hr_oltp    : normalized operational data
---   3. hr_dw      : dimensional data warehouse
---
--- IMPORTANT EXECUTION WORKFLOW
---   A. Execute Sections 1-2 to create databases and staging tables.
---   B. Import the five CSV files into the matching staging tables using
---      MySQL Workbench's Table Data Import Wizard.
---   C. Execute Section 3 to populate normalized OLTP tables.
---   D. Execute Section 4 to create/populate warehouse dimensions and facts.
---
--- Run this file on MySQL 8.0+. It is designed to be rerunnable for table
--- creation, but data-loading INSERT statements should be reviewed before
--- rerunning to avoid duplicate or unintended data.
---
--- Source assumptions confirmed by the team:
---   * EmployeeNumber is consistent across all five CSV files.
---   * One assignment row exists per employee-project pair.
---   * Salary history is represented in employee_scd2_history.csv and
---     Dim_Employee SCD Type 2; no separate OLTP Salary_History table.
--- =============================================================================
-
-
--- =============================================================================
--- SECTION 1: DATABASES
--- =============================================================================
+=============================================================================
 
 CREATE DATABASE IF NOT EXISTS hr_staging
     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
