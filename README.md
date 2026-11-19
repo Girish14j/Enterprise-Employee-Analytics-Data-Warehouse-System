@@ -112,6 +112,32 @@ etl.run_full_sync()                  # everything
 | **Analytics dashboard** | Four tabs, described below. Reads only from the warehouse. |
 | **Warehouse sync** | Pending work, manual full sync, data-quality checks, and any employee's version history. |
 
+## Login and access
+
+The app requires an account linked to an active employee. Passwords are stored as PBKDF2 hashes in
+`hr_oltp.user_accounts`; login access is derived from the employee's current job title:
+
+| Job title | App access |
+|---|---|
+| Human Resources | HR: all pages and actions |
+| Sales Executive | Executive: analytics dashboard only |
+
+Other job roles are not permitted. Page permissions are checked before a page loads its data, and the account
+and employee status plus current job role are revalidated on each page run. Accounts are provisioned by an
+operator, not through public registration.
+
+For an existing database, apply `database/user_accounts_migration.sql` to `hr_oltp` before starting the app.
+For a new database, the master SQL file creates the table. Then create an account for each eligible employee
+from the repository root:
+
+```bash
+python scripts/provision_account.py
+```
+
+The script prompts for the employee's work email and a password of at least 12 characters; password input is
+not echoed. Only active employees with one of the two approved job roles can be provisioned. Run the script
+again to provision any other eligible employees; each employee can have only one account.
+
 **Dashboard tabs**
 
 | Tab | Content | SQL technique |

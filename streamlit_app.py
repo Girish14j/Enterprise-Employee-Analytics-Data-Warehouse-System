@@ -6,6 +6,9 @@ from ui.common import get_service, setup_page, show_error
 setup_page("Employee analytics", "👥",
            "HR operations on the left, warehouse analytics on the right - one connected system.")
 
+if st.session_state["auth_user"]["role"] == "Executive":
+    st.switch_page("pages/5_Analytics_Dashboard.py")
+
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Record changes")

@@ -8,7 +8,8 @@ from ui.common import (category_options, department_picker, get_service, job_rol
                        setup_page, show_error, show_result, supports_income)
 
 setup_page("Onboard employee", "🧑‍💼",
-           "Saves the employee to the operational database, then creates their first warehouse record.")
+           "Saves the employee to the operational database, then creates their first warehouse record.",
+           allowed_roles=("HR",))
 svc = get_service()
 
 # Banner from the previous save. It is kept in session state so it survives the rerun that
